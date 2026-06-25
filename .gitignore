@@ -1,0 +1,7 @@
+.env
+token_cache.json
+artist_gender_cache.json
+config.json
+__pycache__/
+.pytest_cache/
+*.pyc
