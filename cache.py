@@ -14,9 +14,17 @@ VALID_GROUP_COMPOSITIONS = {
     "all_other",
     "unknown",
 }
+VALID_ARTIST_ROLES = {"unknown", "performer", "composer_or_score"}
 GENDER_ALIASES = {
     "nonbinary": "other",
     "non-binary": "other",
+}
+ARTIST_ROLE_ALIASES = {
+    "composer": "composer_or_score",
+    "score": "composer_or_score",
+    "score_composer": "composer_or_score",
+    "soundtrack": "composer_or_score",
+    "soundtrack_composer": "composer_or_score",
 }
 GROUP_COMPOSITION_ALIASES = {
     "male": "all_male",
@@ -36,6 +44,11 @@ def normalize_gender(gender: str) -> str:
 def normalize_group_composition(group_composition: str) -> str:
     normalized = group_composition.strip().lower()
     return GROUP_COMPOSITION_ALIASES.get(normalized, normalized)
+
+
+def normalize_artist_role(artist_role: str) -> str:
+    normalized = artist_role.strip().lower()
+    return ARTIST_ROLE_ALIASES.get(normalized, normalized)
 
 
 class ArtistGenderCache:
@@ -66,6 +79,7 @@ class ArtistGenderCache:
         tmp_path.replace(self.path)
 
     def get(self, spotify_artist_id: str) -> dict[str, Any] | None:
+        self.load()
         entry = self._data.get(spotify_artist_id)
         return dict(entry) if isinstance(entry, dict) else None
 
@@ -77,6 +91,7 @@ class ArtistGenderCache:
         source: str,
         confidence: float,
         group_composition: str | None = None,
+        artist_role: str | None = None,
     ) -> dict[str, Any]:
         gender = normalize_gender(gender)
         if gender not in VALID_GENDERS:
@@ -93,11 +108,17 @@ class ArtistGenderCache:
                 f"Invalid group composition '{group_composition}'. "
                 f"Expected one of {sorted(VALID_GROUP_COMPOSITIONS)}"
             )
+        artist_role = normalize_artist_role(artist_role or "unknown")
+        if artist_role not in VALID_ARTIST_ROLES:
+            raise ValueError(
+                f"Invalid artist role '{artist_role}'. Expected one of {sorted(VALID_ARTIST_ROLES)}"
+            )
 
         entry = {
             "name": name,
             "gender": gender,
             "group_composition": group_composition,
+            "artist_role": artist_role,
             "source": source,
             "confidence": max(0.0, min(1.0, float(confidence))),
         }
@@ -111,6 +132,7 @@ class ArtistGenderCache:
         gender: str,
         name: str | None = None,
         group_composition: str | None = None,
+        artist_role: str | None = None,
     ) -> dict[str, Any]:
         existing = self.get(spotify_artist_id) or {}
         label_name = name or str(existing.get("name") or spotify_artist_id)
@@ -118,6 +140,8 @@ class ArtistGenderCache:
             group_composition = str(existing.get("group_composition") or "")
             if not group_composition:
                 group_composition = "unknown" if normalize_gender(gender) == "group" else "not_group"
+        if artist_role is None:
+            artist_role = str(existing.get("artist_role") or "unknown")
         return self.set(
             spotify_artist_id=spotify_artist_id,
             name=label_name,
@@ -125,6 +149,7 @@ class ArtistGenderCache:
             source="manual",
             confidence=1.0,
             group_composition=group_composition,
+            artist_role=artist_role,
         )
 
     def as_dict(self) -> dict[str, dict[str, Any]]:

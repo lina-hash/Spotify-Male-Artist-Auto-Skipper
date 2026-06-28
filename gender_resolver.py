@@ -10,8 +10,10 @@ from typing import Any
 import httpx
 
 from cache import (
+    VALID_ARTIST_ROLES,
     VALID_GROUP_COMPOSITIONS,
     ArtistGenderCache,
+    normalize_artist_role,
     normalize_gender,
     normalize_group_composition,
 )
@@ -52,6 +54,16 @@ MUSIC_OCCUPATION_QIDS = {
     "Q488205",  # singer-songwriter
     "Q855091",  # vocalist
 }
+COMPOSER_ROLE_QIDS = {
+    "Q36834",  # composer
+}
+PERFORMER_OR_SONGWRITER_QIDS = {
+    "Q177220",  # singer
+    "Q753110",  # songwriter
+    "Q2252262",  # rapper
+    "Q488205",  # singer-songwriter
+    "Q855091",  # vocalist
+}
 MUSIC_DESCRIPTION_TERMS = {
     "singer",
     "musician",
@@ -67,6 +79,32 @@ MUSIC_DESCRIPTION_TERMS = {
     "girl group",
     "k-pop group",
     "kpop group",
+}
+SCORE_COMPOSER_ROLE_TERMS = {
+    "film composer",
+    "film-score composer",
+    "film score",
+    "score composer",
+    "television composer",
+    "tv composer",
+    "soundtrack",
+    "soundtrack composer",
+    "video game composer",
+    "video-game composer",
+    "game music composer",
+    "video game music",
+    "anime composer",
+    "orchestral score",
+}
+PERFORMER_OR_SONGWRITER_DESCRIPTION_TERMS = {
+    "singer-songwriter",
+    "singer songwriter",
+    "singer",
+    "songwriter",
+    "vocalist",
+    "rapper",
+    "recording artist",
+    "idol",
 }
 GROUP_DESCRIPTION_TERMS = {
     "band",
@@ -87,6 +125,7 @@ class ArtistGender:
     source: str
     confidence: float
     group_composition: str = "not_group"
+    artist_role: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -100,6 +139,7 @@ class WikidataCandidate:
     is_group: bool
     is_music_related: bool
     group_composition: str = "not_group"
+    artist_role: str = "unknown"
 
     @property
     def normalized_label(self) -> str:
@@ -137,7 +177,14 @@ class GenderResolver:
         if cached:
             cached_gender = normalize_gender(str(cached.get("gender") or UNKNOWN_GENDER))
             has_group_composition = "group_composition" in cached
+            has_artist_role = "artist_role" in cached
             if cached_gender == "group" and not has_group_composition:
+                cached = None
+            elif (
+                cached_gender == "male"
+                and not has_artist_role
+                and str(cached.get("source") or "") != "manual"
+            ):
                 cached = None
             else:
                 return self._artist_gender_from_cache(spotify_artist_id, name, cached, cached_gender)
@@ -150,6 +197,7 @@ class GenderResolver:
             source=result.source,
             confidence=result.confidence,
             group_composition=result.group_composition,
+            artist_role=result.artist_role,
         )
         return result
 
@@ -160,21 +208,25 @@ class GenderResolver:
         cached: dict[str, Any],
         cached_gender: str,
     ) -> ArtistGender:
-            cached_group_composition = normalize_group_composition(
-                str(cached.get("group_composition") or "unknown")
-            )
-            if cached_group_composition not in VALID_GROUP_COMPOSITIONS:
-                cached_group_composition = "unknown"
-            return ArtistGender(
-                spotify_artist_id=spotify_artist_id,
-                name=str(cached.get("name") or name),
-                gender=cached_gender,
-                source=str(cached.get("source") or "cache"),
-                confidence=float(cached.get("confidence") or 0.0),
-                group_composition=cached_group_composition
-                if cached_gender == "group"
-                else "not_group",
-            )
+        cached_group_composition = normalize_group_composition(
+            str(cached.get("group_composition") or "unknown")
+        )
+        if cached_group_composition not in VALID_GROUP_COMPOSITIONS:
+            cached_group_composition = "unknown"
+        cached_artist_role = normalize_artist_role(str(cached.get("artist_role") or "unknown"))
+        if cached_artist_role not in VALID_ARTIST_ROLES:
+            cached_artist_role = "unknown"
+        return ArtistGender(
+            spotify_artist_id=spotify_artist_id,
+            name=str(cached.get("name") or name),
+            gender=cached_gender,
+            source=str(cached.get("source") or "cache"),
+            confidence=float(cached.get("confidence") or 0.0),
+            group_composition=cached_group_composition
+            if cached_gender == "group"
+            else "not_group",
+            artist_role=cached_artist_role,
+        )
 
     def _resolve_uncached(self, spotify_artist_id: str, name: str) -> ArtistGender:
         musicbrainz_result = self._resolve_with_musicbrainz(spotify_artist_id, name)
@@ -191,6 +243,19 @@ class GenderResolver:
                 return wikidata_result
             return musicbrainz_result
 
+        if musicbrainz_result.gender == "male" and musicbrainz_result.artist_role != "composer_or_score":
+            wikidata_result = self._resolve_with_wikidata(spotify_artist_id, name)
+            if wikidata_result.gender == "male" and wikidata_result.artist_role == "composer_or_score":
+                return ArtistGender(
+                    spotify_artist_id=spotify_artist_id,
+                    name=name,
+                    gender="male",
+                    source="musicbrainz+wikidata",
+                    confidence=min(musicbrainz_result.confidence, wikidata_result.confidence),
+                    group_composition="not_group",
+                    artist_role="composer_or_score",
+                )
+
         if musicbrainz_result.gender in CLEAR_GENDERS:
             return musicbrainz_result
 
@@ -205,12 +270,13 @@ class GenderResolver:
             source=wikidata_result.source,
             confidence=0.0,
             group_composition="not_group",
+            artist_role="unknown",
         )
 
     def _resolve_with_musicbrainz(self, spotify_artist_id: str, name: str) -> ArtistGender:
         try:
             artists = self._query_musicbrainz(name)
-            gender, confidence, group_composition, musicbrainz_artist_id = (
+            gender, confidence, group_composition, musicbrainz_artist_id, artist_role = (
                 choose_musicbrainz_classification(name, artists)
             )
             if gender == "group" and musicbrainz_artist_id:
@@ -220,7 +286,12 @@ class GenderResolver:
                     group_composition = relation_group_composition
         except (httpx.HTTPError, ValueError, RuntimeError) as exc:
             print(f"MusicBrainz lookup failed for {name}: {exc}")
-            gender, confidence, group_composition = UNKNOWN_GENDER, 0.0, "not_group"
+            gender, confidence, group_composition, artist_role = (
+                UNKNOWN_GENDER,
+                0.0,
+                "not_group",
+                "unknown",
+            )
 
         return ArtistGender(
             spotify_artist_id=spotify_artist_id,
@@ -229,6 +300,7 @@ class GenderResolver:
             source="musicbrainz",
             confidence=confidence,
             group_composition=group_composition if gender == "group" else "not_group",
+            artist_role=artist_role,
         )
 
     def _query_musicbrainz(self, name: str) -> list[dict[str, Any]]:
@@ -278,9 +350,15 @@ class GenderResolver:
             gender, confidence, group_composition = choose_wikidata_classification(
                 name, candidates, prefer_group=prefer_group
             )
+            artist_role = choose_wikidata_artist_role(name, candidates)
         except (httpx.HTTPError, ValueError, RuntimeError) as exc:
             print(f"Wikidata lookup failed for {name}: {exc}")
-            gender, confidence, group_composition = UNKNOWN_GENDER, 0.0, "not_group"
+            gender, confidence, group_composition, artist_role = (
+                UNKNOWN_GENDER,
+                0.0,
+                "not_group",
+                "unknown",
+            )
 
         return ArtistGender(
             spotify_artist_id=spotify_artist_id,
@@ -289,6 +367,7 @@ class GenderResolver:
             source="wikidata",
             confidence=confidence,
             group_composition=group_composition,
+            artist_role=artist_role,
         )
 
     def _search_wikidata(self, name: str) -> list[dict[str, Any]]:
@@ -369,6 +448,7 @@ class GenderResolver:
                     "is_group": is_group,
                     "is_music_related": bool(occupations & MUSIC_OCCUPATION_QIDS)
                     or _description_is_music_related(description),
+                    "artist_role": _artist_role_from_wikidata(occupations, description),
                     "member_qids": member_qids,
                     "group_hint_composition": _group_composition_from_wikidata_hints(
                         instance_of, description
@@ -408,6 +488,7 @@ class GenderResolver:
                     group_composition=group_composition
                     if part["is_group"]
                     else "not_group",
+                    artist_role=part["artist_role"],
                 )
             )
 
@@ -517,7 +598,7 @@ LIMIT 100
 
 
 def choose_musicbrainz_gender(name: str, artists: list[dict[str, Any]]) -> tuple[str, float]:
-    gender, confidence, _group_composition, _musicbrainz_artist_id = (
+    gender, confidence, _group_composition, _musicbrainz_artist_id, _artist_role = (
         choose_musicbrainz_classification(name, artists)
     )
     return gender, confidence
@@ -525,12 +606,12 @@ def choose_musicbrainz_gender(name: str, artists: list[dict[str, Any]]) -> tuple
 
 def choose_musicbrainz_classification(
     name: str, artists: list[dict[str, Any]]
-) -> tuple[str, float, str, str | None]:
+) -> tuple[str, float, str, str | None, str]:
     candidates = [_candidate_from_musicbrainz_artist(artist) for artist in artists]
     candidates = [candidate for candidate in candidates if candidate["score"] >= 70]
 
     if not candidates:
-        return UNKNOWN_GENDER, 0.0, "not_group", None
+        return UNKNOWN_GENDER, 0.0, "not_group", None, "unknown"
 
     target_name = _normalize_name(name)
     exact_matches = [
@@ -543,7 +624,7 @@ def choose_musicbrainz_classification(
     sorted_candidates = sorted(candidates, key=lambda item: item["score"], reverse=True)
     max_score = sorted_candidates[0]["score"]
     if max_score < 85:
-        return UNKNOWN_GENDER, round(max_score / 200, 2), "not_group", None
+        return UNKNOWN_GENDER, round(max_score / 200, 2), "not_group", None, "unknown"
 
     top_pool = [
         candidate for candidate in sorted_candidates if candidate["score"] >= max_score - 3
@@ -556,6 +637,31 @@ def choose_wikidata_gender(
 ) -> tuple[str, float]:
     gender, confidence, _group_composition = choose_wikidata_classification(name, candidates)
     return gender, confidence
+
+
+def choose_wikidata_artist_role(name: str, candidates: list[WikidataCandidate]) -> str:
+    target_name = _normalize_name(name)
+    exact_people = [
+        candidate
+        for candidate in candidates
+        if candidate.normalized_label == target_name
+        and candidate.is_human
+        and candidate.artist_role == "composer_or_score"
+    ]
+    if len(exact_people) == 1:
+        return "composer_or_score"
+
+    fuzzy_people = [
+        candidate
+        for candidate in candidates
+        if candidate.is_human
+        and candidate.artist_role == "composer_or_score"
+        and _name_similarity(name, candidate.label) >= 0.92
+    ]
+    if len(fuzzy_people) == 1:
+        return "composer_or_score"
+
+    return "unknown"
 
 
 def choose_wikidata_classification(
@@ -621,16 +727,16 @@ def choose_wikidata_classification(
 
 def _choose_musicbrainz_pool(
     pool: list[dict[str, Any]], *, exact: bool
-) -> tuple[str, float, str, str | None]:
+) -> tuple[str, float, str, str | None, str]:
     if len(pool) > 1:
         genders = {candidate["gender"] for candidate in pool}
         if len(genders) > 1:
             best_score = max(candidate["score"] for candidate in pool)
-            return UNKNOWN_GENDER, round(min(0.5, best_score / 200), 2), "not_group", None
+            return UNKNOWN_GENDER, round(min(0.5, best_score / 200), 2), "not_group", None, "unknown"
 
     best = sorted(pool, key=lambda item: item["score"], reverse=True)[0]
     if best["gender"] == UNKNOWN_GENDER:
-        return UNKNOWN_GENDER, 0.0, "not_group", None
+        return UNKNOWN_GENDER, 0.0, "not_group", None, "unknown"
     gender = str(best["gender"])
     group_composition = "unknown" if gender == "group" else "not_group"
     return (
@@ -638,6 +744,7 @@ def _choose_musicbrainz_pool(
         _confidence_from_score(int(best["score"]), exact),
         group_composition,
         str(best["id"]) if best.get("id") else None,
+        str(best["artist_role"]),
     )
 
 
@@ -698,6 +805,7 @@ def _candidate_from_musicbrainz_artist(artist: dict[str, Any]) -> dict[str, Any]
         "score": _parse_score(artist.get("score")),
         "gender": gender,
         "type": artist_type,
+        "artist_role": _artist_role_from_musicbrainz_artist(artist),
     }
 
 
@@ -710,6 +818,47 @@ def _musicbrainz_gender_value(value: Any) -> str:
     if mb_gender in {"other", "non-binary", "nonbinary", "transgender", "intersex"}:
         return "other"
     return UNKNOWN_GENDER
+
+
+def _artist_role_from_musicbrainz_artist(artist: dict[str, Any]) -> str:
+    text_parts = [
+        str(artist.get("disambiguation") or ""),
+        str(artist.get("sort-name") or ""),
+    ]
+    tags = artist.get("tags", [])
+    if isinstance(tags, list):
+        for tag in tags:
+            if isinstance(tag, dict):
+                text_parts.append(str(tag.get("name") or ""))
+
+    return _artist_role_from_text(" ".join(text_parts))
+
+
+def _artist_role_from_wikidata(occupations: set[str], description: str) -> str:
+    text_role = _artist_role_from_text(description)
+    if text_role == "composer_or_score":
+        return "composer_or_score"
+
+    is_generic_composer = bool(occupations & COMPOSER_ROLE_QIDS)
+    is_performer_or_songwriter = bool(
+        occupations & PERFORMER_OR_SONGWRITER_QIDS
+    ) or _description_is_performer_or_songwriter(description)
+    if is_generic_composer and not is_performer_or_songwriter:
+        return "composer_or_score"
+
+    return "unknown"
+
+
+def _artist_role_from_text(text: str) -> str:
+    lower = text.lower()
+    if any(term in lower for term in SCORE_COMPOSER_ROLE_TERMS):
+        return "composer_or_score"
+    return "unknown"
+
+
+def _description_is_performer_or_songwriter(description: str) -> bool:
+    lower = description.lower()
+    return any(term in lower for term in PERFORMER_OR_SONGWRITER_DESCRIPTION_TERMS)
 
 
 def _wikidata_gender(gender_qids: set[str]) -> str:

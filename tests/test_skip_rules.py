@@ -2,10 +2,20 @@ from __future__ import annotations
 
 from cache import ArtistGenderCache
 from gender_resolver import ArtistGender
-from main import DEFAULT_CONFIG, prompt_for_unknown_artist_labels, should_skip
+from main import (
+    DEFAULT_CONFIG,
+    _is_liked_songs_playback,
+    prompt_for_unknown_artist_labels,
+    should_skip,
+)
 
 
-def artist(name: str, gender: str, group_composition: str = "not_group") -> ArtistGender:
+def artist(
+    name: str,
+    gender: str,
+    group_composition: str = "not_group",
+    artist_role: str = "unknown",
+) -> ArtistGender:
     return ArtistGender(
         spotify_artist_id=name.lower().replace(" ", "-"),
         name=name,
@@ -13,6 +23,7 @@ def artist(name: str, gender: str, group_composition: str = "not_group") -> Arti
         source="test",
         confidence=1.0,
         group_composition=group_composition,
+        artist_role=artist_role,
     )
 
 
@@ -40,6 +51,74 @@ def test_only_main_artist_when_configured() -> None:
 
     assert should_skip_track is False
     assert "no configured skip condition" in reason
+
+
+def test_male_composer_is_kept_by_default() -> None:
+    config = dict(DEFAULT_CONFIG)
+
+    should_skip_track, reason = should_skip(
+        [artist("Favorite Composer", "male", artist_role="composer_or_score")],
+        config,
+    )
+
+    assert should_skip_track is False
+    assert "protected male composer" in reason
+
+
+def test_male_composer_can_be_skipped_when_protection_disabled() -> None:
+    config = dict(DEFAULT_CONFIG)
+    config["keep_male_composers"] = False
+
+    should_skip_track, reason = should_skip(
+        [artist("Favorite Composer", "male", artist_role="composer_or_score")],
+        config,
+    )
+
+    assert should_skip_track is True
+    assert "Favorite Composer" in reason
+
+
+def test_male_singer_still_skips_when_composer_is_protected() -> None:
+    config = dict(DEFAULT_CONFIG)
+
+    should_skip_track, reason = should_skip(
+        [
+            artist("Favorite Composer", "male", artist_role="composer_or_score"),
+            artist("Male Singer", "male"),
+        ],
+        config,
+    )
+
+    assert should_skip_track is True
+    assert "Male Singer" in reason
+
+
+def test_liked_songs_context_is_exempt_by_default() -> None:
+    config = dict(DEFAULT_CONFIG)
+    playback = {
+        "context": {
+            "type": "collection",
+            "href": "https://api.spotify.com/v1/me/tracks",
+            "uri": "spotify:user:example:collection",
+        }
+    }
+
+    assert _is_liked_songs_playback(playback, config) is True
+
+
+def test_liked_songs_exemption_can_be_disabled() -> None:
+    config = dict(DEFAULT_CONFIG)
+    config["keep_liked_songs"] = False
+    playback = {"context": {"type": "collection"}}
+
+    assert _is_liked_songs_playback(playback, config) is False
+
+
+def test_me_tracks_href_is_treated_as_liked_songs() -> None:
+    config = dict(DEFAULT_CONFIG)
+    playback = {"context": {"type": "playlist", "href": "https://api.spotify.com/v1/me/tracks"}}
+
+    assert _is_liked_songs_playback(playback, config) is True
 
 
 def test_skip_unknown_when_enabled() -> None:

@@ -17,8 +17,10 @@ except ImportError:
 
 from cache import (
     ArtistGenderCache,
+    VALID_ARTIST_ROLES,
     VALID_GENDERS,
     VALID_GROUP_COMPOSITIONS,
+    normalize_artist_role,
     normalize_gender,
     normalize_group_composition,
 )
@@ -43,6 +45,8 @@ DEFAULT_CONFIG = {
     "skip_unknown": False,
     "skip_groups": False,
     "skip_all_male_groups": False,
+    "keep_male_composers": True,
+    "keep_liked_songs": True,
     "prompt_on_unknown": False,
     "dry_run": False,
 }
@@ -92,6 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--group-composition",
         choices=sorted(VALID_GROUP_COMPOSITIONS - {"not_group"}),
         help="Optional group composition when gender is group.",
+    )
+    label_parser.add_argument(
+        "--artist-role",
+        choices=sorted(VALID_ARTIST_ROLES),
+        help="Optional artist role, e.g. composer_or_score.",
     )
     label_parser.add_argument(
         "--cache", default="artist_gender_cache.json", help="Path to artist gender cache."
@@ -159,6 +168,7 @@ def label_artist(args: argparse.Namespace) -> int:
         gender=args.gender,
         name=args.name,
         group_composition=args.group_composition,
+        artist_role=args.artist_role,
     )
     group_details = (
         f", group_composition={entry['group_composition']}"
@@ -224,6 +234,11 @@ def process_playback_once(
     print(f"Now playing: {track_name} - {', '.join(artist['name'] for artist in artists)}")
     print(f"Album: {album_name}")
 
+    if _is_liked_songs_playback(playback, config):
+        print("Action: keep (Liked Songs source is exempt)")
+        state["last_track_id"] = track_id
+        return
+
     artist_results: list[ArtistGender] = []
     for artist in artists:
         result = resolver.resolve_artist(artist["id"], artist["name"])
@@ -267,9 +282,23 @@ def should_skip(
         else artist_results[:1]
     )
 
-    male_names = [_result_name(result) for result in considered if _result_gender(result) == "male"]
+    male_names = [
+        _result_name(result)
+        for result in considered
+        if _result_gender(result) == "male"
+        and not _is_protected_male_composer(result, config)
+    ]
     if male_names:
         return True, f"male artist detected: {', '.join(male_names)}"
+
+    protected_male_names = [
+        _result_name(result)
+        for result in considered
+        if _result_gender(result) == "male"
+        and _is_protected_male_composer(result, config)
+    ]
+    if protected_male_names:
+        return False, f"protected male composer/score artist: {', '.join(protected_male_names)}"
 
     if bool(config.get("skip_unknown", False)):
         unknown_names = [
@@ -368,6 +397,7 @@ def _prompt_for_unknown_gender_label(
         source="manual",
         confidence=float(entry["confidence"]),
         group_composition=str(entry["group_composition"]),
+        artist_role=str(entry["artist_role"]),
     )
     print(f"Runtime label saved: {_format_artist_result(updated)}")
     return updated, False
@@ -411,6 +441,7 @@ def _prompt_for_unknown_group_composition(
         source="manual",
         confidence=float(entry["confidence"]),
         group_composition=str(entry["group_composition"]),
+        artist_role=str(entry["artist_role"]),
     )
     print(f"Runtime group composition saved: {_format_artist_result(updated)}")
     return updated, False
@@ -520,6 +551,8 @@ def load_config(path: Path) -> dict[str, Any]:
         "skip_unknown",
         "skip_groups",
         "skip_all_male_groups",
+        "keep_male_composers",
+        "keep_liked_songs",
         "prompt_on_unknown",
         "dry_run",
     ):
@@ -548,6 +581,26 @@ def _extract_artists(item: dict[str, Any]) -> list[dict[str, str]]:
     return artists
 
 
+def _is_liked_songs_playback(playback: dict[str, Any], config: dict[str, Any]) -> bool:
+    if not bool(config.get("keep_liked_songs", True)):
+        return False
+
+    context = playback.get("context")
+    if not isinstance(context, dict):
+        return False
+
+    context_type = str(context.get("type") or "").strip().lower()
+    context_href = str(context.get("href") or "").strip().lower().rstrip("/")
+    context_uri = str(context.get("uri") or "").strip().lower()
+
+    return (
+        context_type == "collection"
+        or context_href.endswith("/me/tracks")
+        or context_uri.endswith(":collection")
+        or context_uri == "spotify:collection:tracks"
+    )
+
+
 def _result_gender(result: ArtistGender | dict[str, Any]) -> str:
     if isinstance(result, ArtistGender):
         return result.gender
@@ -566,12 +619,30 @@ def _result_group_composition(result: ArtistGender | dict[str, Any]) -> str:
     return normalize_group_composition(str(result.get("group_composition") or "unknown"))
 
 
+def _result_artist_role(result: ArtistGender | dict[str, Any]) -> str:
+    if isinstance(result, ArtistGender):
+        return result.artist_role
+    return normalize_artist_role(str(result.get("artist_role") or "unknown"))
+
+
+def _is_protected_male_composer(
+    result: ArtistGender | dict[str, Any],
+    config: dict[str, Any],
+) -> bool:
+    return bool(config.get("keep_male_composers", True)) and (
+        _result_artist_role(result) == "composer_or_score"
+    )
+
+
 def _format_artist_result(result: ArtistGender) -> str:
     group_details = (
         f", group_composition={result.group_composition}" if result.gender == "group" else ""
     )
+    role_details = (
+        f", artist_role={result.artist_role}" if result.artist_role != "unknown" else ""
+    )
     return (
-        f"{result.name} => {result.gender}{group_details}, "
+        f"{result.name} => {result.gender}{group_details}{role_details}, "
         f"confidence={result.confidence:.2f}, source={result.source}, "
         f"spotify_artist_id={result.spotify_artist_id}"
     )

@@ -12,7 +12,9 @@ from gender_resolver import (
     GenderResolver,
     WikidataCandidate,
     choose_musicbrainz_group_composition,
+    choose_musicbrainz_classification,
     choose_musicbrainz_gender,
+    choose_wikidata_artist_role,
     choose_wikidata_classification,
     choose_wikidata_gender,
 )
@@ -112,6 +114,220 @@ def test_resolver_caches_musicbrainz_result(tmp_path) -> None:
 
     assert result.gender == "male"
     assert cache.get("spotify-id")["gender"] == "male"
+
+
+def test_resolver_marks_male_composer_role_from_wikidata(tmp_path) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        action = request.url.params.get("action")
+        if "musicbrainz.org" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "artists": [
+                        {
+                            "id": "mbid-composer",
+                            "name": "Composer A",
+                            "score": 100,
+                            "type": "Person",
+                            "gender": "male",
+                        }
+                    ]
+                },
+            )
+        if action == "wbsearchentities":
+            return httpx.Response(
+                200,
+                json={
+                    "search": [
+                        {
+                            "id": "Q300",
+                            "label": "Composer A",
+                            "description": "film score composer",
+                        }
+                    ]
+                },
+            )
+        if action == "wbgetentities":
+            return httpx.Response(
+                200,
+                json={
+                    "entities": {
+                        "Q300": {
+                            "labels": {"en": {"value": "Composer A"}},
+                            "descriptions": {"en": {"value": "film score composer"}},
+                            "claims": {
+                                "P31": [_claim(HUMAN_QID)],
+                                "P106": [_claim("Q36834")],
+                                "P21": [_claim(MALE_QID)],
+                            },
+                        }
+                    }
+                },
+            )
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    resolver = GenderResolver(cache, client=client, min_request_interval_seconds=0)
+
+    result = resolver.resolve_artist("spotify-id", "Composer A")
+
+    assert result.gender == "male"
+    assert result.artist_role == "composer_or_score"
+    assert result.source == "musicbrainz+wikidata"
+    assert cache.get("spotify-id")["artist_role"] == "composer_or_score"
+
+
+def test_resolver_keeps_generic_composer_without_performer_role(tmp_path) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        action = request.url.params.get("action")
+        if "musicbrainz.org" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "artists": [
+                        {
+                            "id": "mbid-classical-composer",
+                            "name": "Classical Composer",
+                            "score": 100,
+                            "type": "Person",
+                            "gender": "male",
+                        }
+                    ]
+                },
+            )
+        if action == "wbsearchentities":
+            return httpx.Response(
+                200,
+                json={
+                    "search": [
+                        {
+                            "id": "Q301",
+                            "label": "Classical Composer",
+                            "description": "Japanese composer and conductor",
+                        }
+                    ]
+                },
+            )
+        if action == "wbgetentities":
+            return httpx.Response(
+                200,
+                json={
+                    "entities": {
+                        "Q301": {
+                            "labels": {"en": {"value": "Classical Composer"}},
+                            "descriptions": {
+                                "en": {"value": "Japanese composer and conductor"}
+                            },
+                            "claims": {
+                                "P31": [_claim(HUMAN_QID)],
+                                "P106": [_claim("Q36834")],
+                                "P21": [_claim(MALE_QID)],
+                            },
+                        }
+                    }
+                },
+            )
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    resolver = GenderResolver(cache, client=client, min_request_interval_seconds=0)
+
+    result = resolver.resolve_artist("spotify-id", "Classical Composer")
+
+    assert result.gender == "male"
+    assert result.artist_role == "composer_or_score"
+    assert result.source == "musicbrainz+wikidata"
+
+
+def test_resolver_does_not_keep_singer_songwriter_as_composer(tmp_path) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        action = request.url.params.get("action")
+        if "musicbrainz.org" in str(request.url):
+            return httpx.Response(
+                200,
+                json={
+                    "artists": [
+                        {
+                            "id": "mbid-singer-songwriter",
+                            "name": "Singer Songwriter",
+                            "score": 100,
+                            "type": "Person",
+                            "gender": "male",
+                        }
+                    ]
+                },
+            )
+        if action == "wbsearchentities":
+            return httpx.Response(
+                200,
+                json={
+                    "search": [
+                        {
+                            "id": "Q302",
+                            "label": "Singer Songwriter",
+                            "description": "American singer-songwriter and composer",
+                        }
+                    ]
+                },
+            )
+        if action == "wbgetentities":
+            return httpx.Response(
+                200,
+                json={
+                    "entities": {
+                        "Q302": {
+                            "labels": {"en": {"value": "Singer Songwriter"}},
+                            "descriptions": {
+                                "en": {"value": "American singer-songwriter and composer"}
+                            },
+                            "claims": {
+                                "P31": [_claim(HUMAN_QID)],
+                                "P106": [_claim("Q36834"), _claim("Q488205")],
+                                "P21": [_claim(MALE_QID)],
+                            },
+                        }
+                    }
+                },
+            )
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    resolver = GenderResolver(cache, client=client, min_request_interval_seconds=0)
+
+    result = resolver.resolve_artist("spotify-id", "Singer Songwriter")
+
+    assert result.gender == "male"
+    assert result.artist_role == "unknown"
+    assert result.source == "musicbrainz"
+
+
+def test_musicbrainz_tags_can_mark_composer_role() -> None:
+    gender, confidence, group_composition, _artist_id, artist_role = (
+        choose_musicbrainz_classification(
+            "Composer B",
+            [
+                {
+                    "id": "mbid-composer-b",
+                    "name": "Composer B",
+                    "score": 100,
+                    "type": "Person",
+                    "gender": "male",
+                    "tags": [{"name": "film score"}],
+                }
+            ],
+        )
+    )
+
+    assert gender == "male"
+    assert confidence == 0.98
+    assert group_composition == "not_group"
+    assert artist_role == "composer_or_score"
 
 
 def test_resolver_enriches_musicbrainz_group_with_artist_rels(tmp_path) -> None:
