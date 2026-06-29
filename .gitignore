@@ -2,6 +2,12 @@
 token_cache.json
 artist_gender_cache.json
 config.json
+.venv/
+run_spotify_skipper.bat
+start-skipper.ps1
+logs/
+*.lnk
+*.url
 __pycache__/
 .pytest_cache/
 *.pyc
