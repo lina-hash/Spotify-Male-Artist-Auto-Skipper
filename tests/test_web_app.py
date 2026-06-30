@@ -11,8 +11,16 @@ from web_app import WEB_HTML, create_web_app
 
 
 class FakeSpotify:
-    def __init__(self, playback: dict[str, Any] | None) -> None:
-        self.playback = playback
+    def __init__(
+        self,
+        playback: dict[str, Any] | None,
+        queue: dict[str, Any] | None = None,
+        playback_sequence: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.playback_sequence = playback_sequence or []
+        self.playback_index = 0
+        self.playback = self.playback_sequence[0] if self.playback_sequence else playback
+        self.queue = queue
         self.skip_calls: list[str | None] = []
         self.previous_calls: list[str | None] = []
         self.saved_track_ids: list[str] = []
@@ -21,8 +29,14 @@ class FakeSpotify:
     def get_current_playback(self) -> dict[str, Any] | None:
         return self.playback
 
+    def get_queue(self) -> dict[str, Any] | None:
+        return self.queue
+
     def skip_to_next(self, *, device_id: str | None = None) -> bool:
         self.skip_calls.append(device_id)
+        if self.playback_sequence and self.playback_index < len(self.playback_sequence) - 1:
+            self.playback_index += 1
+            self.playback = self.playback_sequence[self.playback_index]
         return True
 
     def skip_to_previous(self, *, device_id: str | None = None) -> bool:
@@ -41,8 +55,10 @@ class FakeSpotify:
 class FakeResolver:
     def __init__(self, results: dict[str, ArtistGender]) -> None:
         self.results = results
+        self.calls: list[tuple[str, str]] = []
 
     def resolve_artist(self, spotify_artist_id: str, name: str) -> ArtistGender:
+        self.calls.append((spotify_artist_id, name))
         return self.results[spotify_artist_id]
 
 
@@ -146,6 +162,75 @@ def test_web_track_artist_display_shows_group_composition(tmp_path) -> None:
     assert payload["track"]["artists"][0]["display_label"] == "group, all_female"
 
 
+def test_web_current_prefetches_three_queue_tracks(tmp_path) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+    spotify = FakeSpotify(_track_playback(), queue=_queue_payload())
+    resolver = FakeResolver(
+        {
+            "artist-1": ArtistGender(
+                spotify_artist_id="artist-1",
+                name="Mystery Artist",
+                gender="female",
+                source="manual",
+                confidence=1.0,
+            ),
+            "queue-artist-1": ArtistGender(
+                spotify_artist_id="queue-artist-1",
+                name="Queue Artist 1",
+                gender="male",
+                source="manual",
+                confidence=1.0,
+            ),
+            "queue-artist-2": ArtistGender(
+                spotify_artist_id="queue-artist-2",
+                name="Queue Artist 2",
+                gender="female",
+                source="manual",
+                confidence=1.0,
+            ),
+            "queue-artist-3": ArtistGender(
+                spotify_artist_id="queue-artist-3",
+                name="Queue Artist 3",
+                gender="group",
+                source="manual",
+                confidence=1.0,
+                group_composition="all_female",
+            ),
+            "queue-artist-4": ArtistGender(
+                spotify_artist_id="queue-artist-4",
+                name="Queue Artist 4",
+                gender="male",
+                source="manual",
+                confidence=1.0,
+            ),
+        }
+    )
+    app = create_web_app(
+        spotify=spotify,
+        resolver=resolver,
+        cache=cache,
+        config={"queue_prefetch_tracks": 3},
+        should_skip_func=lambda artists, config: (
+            any(artist.gender == "male" for artist in artists),
+            "male artist detected" if any(artist.gender == "male" for artist in artists) else "keep",
+        ),
+        is_liked_songs_func=lambda playback, config: False,
+    )
+    client = TestClient(app)
+
+    payload = client.get("/api/current").json()
+
+    assert [track["id"] for track in payload["queue"]["tracks"]] == [
+        "queue-track-1",
+        "queue-track-2",
+        "queue-track-3",
+    ]
+    assert payload["queue"]["tracks"][0]["artists"][0]["gender"] == "male"
+    assert payload["queue"]["tracks"][0]["decision"]["would_skip"] is True
+    assert payload["queue"]["tracks"][2]["artists"][0]["display_label"] == "group, all_female"
+    assert ("queue-artist-4", "Queue Artist 4") not in resolver.calls
+
+
 def test_web_label_writes_manual_cache(tmp_path) -> None:
     cache = ArtistGenderCache(tmp_path / "cache.json")
     app = create_web_app(
@@ -190,6 +275,164 @@ def test_web_next_endpoint_skips_to_next_track(tmp_path) -> None:
     assert response.status_code == 200
     assert response.json()["performed"] is True
     assert spotify.skip_calls == [None]
+
+
+def test_web_skip_to_keep_endpoint_uses_cache_until_keep_track(tmp_path) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+    cache.label("current-artist", "male", name="Current Artist")
+    cache.label("male-artist-1", "male", name="Male Artist 1")
+    cache.label("male-artist-2", "male", name="Male Artist 2")
+    cache.label("female-artist", "female", name="Female Artist")
+    spotify = FakeSpotify(
+        None,
+        playback_sequence=[
+            _track_playback_for("current-track", "Current Song", "current-artist", "Current Artist"),
+            _track_playback_for("skip-track-1", "Skip Song 1", "male-artist-1", "Male Artist 1"),
+            _track_playback_for("skip-track-2", "Skip Song 2", "male-artist-2", "Male Artist 2"),
+            _track_playback_for("keep-track", "Keep Song", "female-artist", "Female Artist"),
+        ],
+    )
+    app = create_web_app(
+        spotify=spotify,
+        resolver=FakeResolver({}),
+        cache=cache,
+        config={"smart_skip_max_tracks": 10},
+        should_skip_func=lambda artists, config: (
+            any(artist.gender == "male" for artist in artists),
+            "male artist detected" if any(artist.gender == "male" for artist in artists) else "keep",
+        ),
+        is_liked_songs_func=lambda playback, config: False,
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/player/skip-to-keep")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["performed"] is True
+    assert payload["skipped_count"] == 3
+    assert payload["stopped_on"] == "keep"
+    assert payload["final_track"]["id"] == "keep-track"
+    assert payload["final_track"]["artists"][0]["gender"] == "female"
+    assert spotify.skip_calls == ["device-1", "device-1", "device-1"]
+
+
+def test_web_skip_to_keep_skips_current_track_before_judging(tmp_path) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+    cache.label("current-artist", "female", name="Current Artist")
+    spotify = FakeSpotify(
+        None,
+        playback_sequence=[
+            _track_playback_for("current-track", "Current Song", "current-artist", "Current Artist"),
+            _track_playback_for("next-track", "Next Song", "male-artist", "Male Artist"),
+        ],
+    )
+    app = create_web_app(
+        spotify=spotify,
+        resolver=FakeResolver({}),
+        cache=cache,
+        config={"smart_skip_max_tracks": 10},
+        should_skip_func=lambda artists, config: (
+            any(artist.gender == "male" for artist in artists),
+            "male artist detected" if any(artist.gender == "male" for artist in artists) else "keep",
+        ),
+        is_liked_songs_func=lambda playback, config: False,
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/player/skip-to-keep")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["performed"] is True
+    assert payload["skipped_count"] == 1
+    assert payload["stopped_on"] == "keep"
+    assert payload["final_track"]["id"] == "next-track"
+    assert spotify.skip_calls == ["device-1"]
+
+
+def test_web_current_keeps_track_selected_by_skip_to_keep(tmp_path) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+    cache.label("current-artist", "male", name="Current Artist")
+    cache.label("female-artist", "female", name="Female Artist")
+    spotify = FakeSpotify(
+        None,
+        playback_sequence=[
+            _track_playback_for("current-track", "Current Song", "current-artist", "Current Artist"),
+            _track_playback_for("keep-track", "Keep Song", "female-artist", "Female Artist"),
+        ],
+    )
+    app = create_web_app(
+        spotify=spotify,
+        resolver=FakeResolver(
+            {
+                "female-artist": ArtistGender(
+                    spotify_artist_id="female-artist",
+                    name="Female Artist",
+                    gender="male",
+                    source="test",
+                    confidence=1.0,
+                )
+            }
+        ),
+        cache=cache,
+        config={"smart_skip_max_tracks": 10},
+        should_skip_func=lambda artists, config: (
+            any(artist.gender == "male" for artist in artists),
+            "male artist detected" if any(artist.gender == "male" for artist in artists) else "keep",
+        ),
+        is_liked_songs_func=lambda playback, config: False,
+    )
+    client = TestClient(app)
+
+    skip_response = client.post("/api/player/skip-to-keep")
+    current_response = client.get("/api/current")
+
+    assert skip_response.status_code == 200
+    assert skip_response.json()["final_track"]["id"] == "keep-track"
+    payload = current_response.json()
+    assert payload["track"]["id"] == "keep-track"
+    assert payload["decision"]["would_skip"] is False
+    assert payload["decision"]["reason"] == "Smart skip stopped on this cached keep track"
+    assert payload["action"]["name"] == "keep"
+    assert spotify.skip_calls == ["device-1"]
+
+
+def test_web_skip_to_keep_stops_when_track_change_is_not_confirmed(tmp_path, monkeypatch) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+    cache.label("current-artist", "male", name="Current Artist")
+    spotify = FakeSpotify(
+        _track_playback_for("current-track", "Current Song", "current-artist", "Current Artist")
+    )
+
+    def fake_wait_for_track_change(spotify, *, previous_track_id):
+        return spotify.get_current_playback()
+
+    monkeypatch.setattr("web_app._wait_for_track_change", fake_wait_for_track_change)
+    app = create_web_app(
+        spotify=spotify,
+        resolver=FakeResolver({}),
+        cache=cache,
+        config={"smart_skip_max_tracks": 10},
+        should_skip_func=lambda artists, config: (
+            any(artist.gender == "male" for artist in artists),
+            "male artist detected" if any(artist.gender == "male" for artist in artists) else "keep",
+        ),
+        is_liked_songs_func=lambda playback, config: False,
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/player/skip-to-keep")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "error"
+    assert payload["performed"] is True
+    assert payload["skipped_count"] == 1
+    assert payload["stopped_on"] == "track_change_timeout"
+    assert spotify.skip_calls == ["device-1"]
 
 
 def test_web_previous_endpoint_skips_to_previous_track(tmp_path) -> None:
@@ -260,6 +503,8 @@ def test_web_html_uses_adaptive_refresh_intervals() -> None:
     assert "END_REFRESH_WINDOW_MS" in WEB_HTML
     assert "pendingTrackChangeFromTrackId = trackId || pendingTrackChangeFromTrackId" in WEB_HTML
     assert "setTimeout(refresh, nextRefreshDelay(data))" in WEB_HTML
+    assert "setInterval(refresh, 3000)" not in WEB_HTML
+    assert "playerActionInFlight" in WEB_HTML
 
 
 def test_web_html_has_seekable_progress_bar() -> None:
@@ -269,6 +514,12 @@ def test_web_html_has_seekable_progress_bar() -> None:
     assert '"/api/player/seek"' in WEB_HTML
     assert "function formatTime" in WEB_HTML
     assert "isSeeking" in WEB_HTML
+
+
+def test_web_html_has_skip_to_keep_button() -> None:
+    assert 'data-player-action="skip-to-keep"' in WEB_HTML
+    assert '"/api/player/skip-to-keep"' in WEB_HTML
+    assert "跳到保留" in WEB_HTML
 
 
 def test_web_html_has_expandable_album_cover() -> None:
@@ -286,8 +537,34 @@ def test_web_html_links_track_artists_to_wikipedia() -> None:
     assert 'rel="noopener noreferrer"' in WEB_HTML
 
 
+def test_web_html_displays_prefetched_queue_tracks() -> None:
+    assert "function queueHtml" in WEB_HTML
+    assert "function queueTrackHtml" in WEB_HTML
+    assert "已预缓存后续" in WEB_HTML
+    assert "预判跳过" in WEB_HTML
+    assert "预判保留" in WEB_HTML
+    artist_grid_index = WEB_HTML.index(
+        '${data.artists.map((artist) => artistHtml(artist)).join("")}'
+    )
+    queue_index = WEB_HTML.index("${queueHtml(data.queue)}")
+    assert artist_grid_index < queue_index
+
+
 def test_web_html_does_not_show_device_name_badge() -> None:
     assert "Device:" not in WEB_HTML
+
+
+def test_web_html_hides_label_controls_until_edit_for_confirmed_artists() -> None:
+    assert "data-edit-labels" in WEB_HTML
+    assert "data-label-panel" in WEB_HTML
+    assert "artist.needs_gender_label || artist.needs_group_composition_label" in WEB_HTML
+    assert "const expandedLabelArtistIds = new Set();" in WEB_HTML
+    assert "expandedLabelArtistIds.add(button.dataset.artistId)" in WEB_HTML
+    assert "expandedLabelArtistIds.has(artist.spotify_artist_id)" in WEB_HTML
+    assert "expandedLabelArtistIds.clear()" in WEB_HTML
+    assert "expandedLabelArtistIds.delete(payload.spotify_artist_id)" in WEB_HTML
+    assert "panel.hidden = false" in WEB_HTML
+    assert "button.hidden = true" not in WEB_HTML
 
 
 def test_web_current_displays_other_as_non_binary_label(tmp_path) -> None:
@@ -510,6 +787,53 @@ def _track_playback() -> dict[str, Any]:
             },
             "artists": [{"id": "artist-1", "name": "Mystery Artist"}],
         },
+    }
+
+
+def _track_playback_for(
+    track_id: str,
+    track_name: str,
+    artist_id: str,
+    artist_name: str,
+) -> dict[str, Any]:
+    playback = _track_playback()
+    playback["item"] = {
+        "id": track_id,
+        "type": "track",
+        "name": track_name,
+        "duration_ms": 180000,
+        "album": {"name": f"{track_name} Album", "images": []},
+        "artists": [{"id": artist_id, "name": artist_name}],
+    }
+    return playback
+
+
+def _queue_payload() -> dict[str, Any]:
+    return {
+        "currently_playing": None,
+        "queue": [
+            {"id": "episode-1", "type": "episode", "name": "Podcast Episode"},
+            _queue_track("queue-track-1", "Queue Song 1", "queue-artist-1", "Queue Artist 1"),
+            _queue_track("queue-track-2", "Queue Song 2", "queue-artist-2", "Queue Artist 2"),
+            _queue_track("queue-track-3", "Queue Song 3", "queue-artist-3", "Queue Artist 3"),
+            _queue_track("queue-track-4", "Queue Song 4", "queue-artist-4", "Queue Artist 4"),
+        ],
+    }
+
+
+def _queue_track(
+    track_id: str,
+    track_name: str,
+    artist_id: str,
+    artist_name: str,
+) -> dict[str, Any]:
+    return {
+        "id": track_id,
+        "type": "track",
+        "name": track_name,
+        "duration_ms": 180000,
+        "album": {"name": f"{track_name} Album", "images": []},
+        "artists": [{"id": artist_id, "name": artist_name}],
     }
 
 

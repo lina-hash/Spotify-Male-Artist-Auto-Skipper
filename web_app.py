@@ -4,6 +4,7 @@ import base64
 import binascii
 import ipaddress
 import secrets
+import time
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote_plus
@@ -53,6 +54,7 @@ def create_web_app(
 ) -> FastAPI:
     app = FastAPI(title="Spotify Male Artist Auto Skipper")
     app.state.last_skip_attempt_track_id = None
+    app.state.smart_keep_track_id = None
 
     @app.middleware("http")
     async def require_remote_auth(request: Request, call_next: Callable[..., Any]):
@@ -104,37 +106,36 @@ def create_web_app(
             return payload
 
         artists = _extract_artists(item)
-        artist_results: list[ArtistGender] = []
-        for artist in artists:
-            try:
-                artist_results.append(resolver.resolve_artist(artist["id"], artist["name"]))
-            except Exception as exc:
-                artist_results.append(
-                    ArtistGender(
-                        spotify_artist_id=artist["id"],
-                        name=artist["name"],
-                        gender="unknown",
-                        source=f"error: {exc}",
-                        confidence=0.0,
-                    )
-                )
+        artist_results = _resolve_artists(resolver, artists)
 
         liked_songs = is_liked_songs_func(playback, config)
         if liked_songs:
             would_skip, reason = False, "Liked Songs source is exempt"
         else:
             would_skip, reason = should_skip_func(artist_results, config)
+        track_id = str(item.get("id") or "")
+        smart_keep_track_id = getattr(app.state, "smart_keep_track_id", None)
+        if smart_keep_track_id and smart_keep_track_id != track_id:
+            app.state.smart_keep_track_id = None
+        elif smart_keep_track_id == track_id and would_skip:
+            would_skip, reason = False, "Smart skip stopped on this cached keep track"
 
         device = playback.get("device") or {}
         action = _apply_skip_decision(
             spotify=spotify,
             playback=playback,
-            track_id=str(item.get("id") or ""),
+            track_id=track_id,
             would_skip=would_skip,
             reason=reason,
             config=config,
             enable_skip=enable_skip,
             state=app.state,
+        )
+        queue = _queue_prefetch_payload(
+            spotify=spotify,
+            resolver=resolver,
+            config=config,
+            should_skip_func=should_skip_func,
         )
         payload = {
             "status": "ok",
@@ -163,6 +164,7 @@ def create_web_app(
                 "reason": reason,
             },
             "action": action,
+            "queue": queue,
         }
         _log_verbose_playback(payload, verbose)
         return payload
@@ -192,12 +194,30 @@ def create_web_app(
     def next_track() -> dict[str, Any]:
         ok = spotify.skip_to_next()
         app.state.last_skip_attempt_track_id = None
+        app.state.smart_keep_track_id = None
         return {"status": "ok" if ok else "error", "action": "next", "performed": ok}
+
+    @app.post("/api/player/skip-to-keep")
+    def skip_to_keep() -> dict[str, Any]:
+        app.state.last_skip_attempt_track_id = None
+        app.state.smart_keep_track_id = None
+        result = _skip_to_keep(
+            spotify=spotify,
+            cache=cache,
+            config=config,
+            should_skip_func=should_skip_func,
+            is_liked_songs_func=is_liked_songs_func,
+        )
+        final_track = result.get("final_track")
+        if result.get("stopped_on") == "keep" and isinstance(final_track, dict):
+            app.state.smart_keep_track_id = final_track.get("id")
+        return result
 
     @app.post("/api/player/previous")
     def previous_track() -> dict[str, Any]:
         ok = spotify.skip_to_previous()
         app.state.last_skip_attempt_track_id = None
+        app.state.smart_keep_track_id = None
         return {"status": "ok" if ok else "error", "action": "previous", "performed": ok}
 
     @app.post("/api/player/seek")
@@ -230,6 +250,381 @@ def _extract_artists(item: dict[str, Any]) -> list[dict[str, str]]:
         if spotify_id and name:
             artists.append({"id": str(spotify_id), "name": str(name)})
     return artists
+
+
+def _resolve_artists(
+    resolver: GenderResolver,
+    artists: list[dict[str, str]],
+) -> list[ArtistGender]:
+    artist_results: list[ArtistGender] = []
+    for artist in artists:
+        try:
+            artist_results.append(resolver.resolve_artist(artist["id"], artist["name"]))
+        except Exception as exc:
+            artist_results.append(
+                ArtistGender(
+                    spotify_artist_id=artist["id"],
+                    name=artist["name"],
+                    gender="unknown",
+                    source=f"error: {exc}",
+                    confidence=0.0,
+                )
+            )
+    return artist_results
+
+
+def _queue_prefetch_payload(
+    *,
+    spotify: SpotifyClient,
+    resolver: GenderResolver,
+    config: dict[str, Any],
+    should_skip_func: ShouldSkipFunc,
+) -> dict[str, Any]:
+    limit = _queue_prefetch_limit(config)
+    if limit <= 0:
+        return {"tracks": [], "prefetch_limit": 0, "error": ""}
+
+    try:
+        queue_payload = spotify.get_queue()
+    except Exception as exc:
+        return {"tracks": [], "prefetch_limit": limit, "error": str(exc)}
+
+    raw_queue = (queue_payload or {}).get("queue", [])
+    if not isinstance(raw_queue, list):
+        return {"tracks": [], "prefetch_limit": limit, "error": ""}
+
+    tracks: list[dict[str, Any]] = []
+    for item in raw_queue:
+        if len(tracks) >= limit:
+            break
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "track" or not item.get("id"):
+            continue
+
+        artists = _extract_artists(item)
+        artist_results = _resolve_artists(resolver, artists)
+        would_skip, reason = should_skip_func(artist_results, config)
+        tracks.append(
+            {
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or "Unknown track"),
+                "album": str((item.get("album") or {}).get("name") or "Unknown album"),
+                "image_url": _album_image_url(item),
+                "artists": _track_artist_payloads(artists, artist_results),
+                "artist_results": [_artist_result_payload(result) for result in artist_results],
+                "decision": {
+                    "would_skip": would_skip,
+                    "reason": reason,
+                },
+            }
+        )
+
+    return {"tracks": tracks, "prefetch_limit": limit, "error": ""}
+
+
+def _queue_prefetch_limit(config: dict[str, Any]) -> int:
+    try:
+        return max(0, min(10, int(config.get("queue_prefetch_tracks", 3))))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _skip_to_keep(
+    *,
+    spotify: SpotifyClient,
+    cache: ArtistGenderCache,
+    config: dict[str, Any],
+    should_skip_func: ShouldSkipFunc,
+    is_liked_songs_func: LikedSongsFunc,
+) -> dict[str, Any]:
+    limit = _smart_skip_limit(config)
+    if bool(config.get("dry_run", False)):
+        return {
+            "status": "ok",
+            "action": "skip_to_keep",
+            "performed": False,
+            "skipped_count": 0,
+            "stopped_on": "dry_run",
+            "reason": "dry_run is enabled",
+        }
+
+    playback = spotify.get_current_playback()
+    if not playback:
+        return _skip_to_keep_result(
+            status="error",
+            performed=False,
+            skipped_count=0,
+            stopped_on="no_playback",
+            reason="No active Spotify playback.",
+        )
+
+    blocked_reason = _skip_blocked_reason(playback)
+    if blocked_reason:
+        return _skip_to_keep_result(
+            status="error",
+            performed=False,
+            skipped_count=0,
+            stopped_on="blocked",
+            reason=blocked_reason,
+        )
+
+    skipped_count = 0
+    device_id = str((playback.get("device") or {}).get("id") or "") or None
+
+    previous_track_id = _playback_track_id(playback)
+    ok = spotify.skip_to_next(device_id=device_id)
+    if not ok:
+        return _skip_to_keep_result(
+            status="error",
+            performed=False,
+            skipped_count=0,
+            stopped_on="skip_failed",
+            reason="Spotify skip_to_next failed.",
+        )
+
+    skipped_count += 1
+    playback = _wait_for_track_change(
+        spotify,
+        previous_track_id=previous_track_id,
+    )
+    if not playback:
+        return _skip_to_keep_result(
+            status="ok",
+            performed=True,
+            skipped_count=skipped_count,
+            stopped_on="no_playback",
+            reason="No active Spotify playback after skip.",
+        )
+
+    latest_track_id = _playback_track_id(playback)
+    if latest_track_id and latest_track_id == previous_track_id:
+        return _skip_to_keep_result(
+            status="error",
+            performed=True,
+            skipped_count=skipped_count,
+            stopped_on="track_change_timeout",
+            reason="Spotify did not report a new track after skip; stopped to avoid blind skipping.",
+        )
+
+    decision = _cached_playback_decision(
+        playback=playback,
+        cache=cache,
+        config=config,
+        should_skip_func=should_skip_func,
+        is_liked_songs_func=is_liked_songs_func,
+    )
+
+    while skipped_count < limit:
+        if not decision["would_skip"]:
+            return _skip_to_keep_result(
+                status="ok",
+                performed=True,
+                skipped_count=skipped_count,
+                stopped_on="keep",
+                reason=str(decision["reason"]),
+                final_track=decision["track"],
+            )
+
+        blocked_reason = _skip_blocked_reason(playback)
+        if blocked_reason:
+            return _skip_to_keep_result(
+                status="error",
+                performed=skipped_count > 0,
+                skipped_count=skipped_count,
+                stopped_on="blocked",
+                reason=blocked_reason,
+                final_track=decision["track"],
+            )
+
+        previous_track_id = _playback_track_id(playback)
+        ok = spotify.skip_to_next(device_id=device_id)
+        if not ok:
+            return _skip_to_keep_result(
+                status="error",
+                performed=skipped_count > 0,
+                skipped_count=skipped_count,
+                stopped_on="skip_failed",
+                reason="Spotify skip_to_next failed.",
+            )
+
+        skipped_count += 1
+        playback = _wait_for_track_change(
+            spotify,
+            previous_track_id=previous_track_id,
+        )
+        if not playback:
+            return _skip_to_keep_result(
+                status="ok",
+                performed=True,
+                skipped_count=skipped_count,
+                stopped_on="no_playback",
+                reason="No active Spotify playback after skip.",
+            )
+
+        latest_track_id = _playback_track_id(playback)
+        if latest_track_id and latest_track_id == previous_track_id:
+            return _skip_to_keep_result(
+                status="error",
+                performed=True,
+                skipped_count=skipped_count,
+                stopped_on="track_change_timeout",
+                reason="Spotify did not report a new track after skip; stopped to avoid blind skipping.",
+            )
+
+        decision = _cached_playback_decision(
+            playback=playback,
+            cache=cache,
+            config=config,
+            should_skip_func=should_skip_func,
+            is_liked_songs_func=is_liked_songs_func,
+        )
+
+    return _skip_to_keep_result(
+        status="ok",
+        performed=skipped_count > 0,
+        skipped_count=skipped_count,
+        stopped_on="limit_reached",
+        reason=f"Reached smart skip limit ({limit}).",
+    )
+
+
+def _cached_playback_decision(
+    *,
+    playback: dict[str, Any],
+    cache: ArtistGenderCache,
+    config: dict[str, Any],
+    should_skip_func: ShouldSkipFunc,
+    is_liked_songs_func: LikedSongsFunc,
+) -> dict[str, Any]:
+    item = playback.get("item") or {}
+    if playback.get("currently_playing_type") != "track" or item.get("type") != "track":
+        return {
+            "would_skip": False,
+            "reason": "Current Spotify item is not a track.",
+            "track": _playback_track_payload(item, []),
+        }
+
+    artists = _extract_artists(item)
+    artist_results = _resolve_artists_from_cache(cache, artists)
+    if is_liked_songs_func(playback, config):
+        would_skip, reason = False, "Liked Songs source is exempt"
+    else:
+        would_skip, reason = should_skip_func(artist_results, config)
+
+    return {
+        "would_skip": would_skip,
+        "reason": reason,
+        "track": _playback_track_payload(item, artist_results),
+    }
+
+
+def _resolve_artists_from_cache(
+    cache: ArtistGenderCache,
+    artists: list[dict[str, str]],
+) -> list[ArtistGender]:
+    results: list[ArtistGender] = []
+    for artist in artists:
+        entry = cache.get(artist["id"])
+        if not entry:
+            results.append(
+                ArtistGender(
+                    spotify_artist_id=artist["id"],
+                    name=artist["name"],
+                    gender="unknown",
+                    source="cache_miss",
+                    confidence=0.0,
+                )
+            )
+            continue
+
+        results.append(
+            ArtistGender(
+                spotify_artist_id=artist["id"],
+                name=artist["name"],
+                gender=str(entry.get("gender") or "unknown"),
+                source=str(entry.get("source") or "cache"),
+                confidence=float(entry.get("confidence") or 0.0),
+                group_composition=str(entry.get("group_composition") or "not_group"),
+                artist_role=str(entry.get("artist_role") or "unknown"),
+            )
+        )
+    return results
+
+
+def _playback_track_payload(
+    item: dict[str, Any],
+    artist_results: list[ArtistGender],
+) -> dict[str, Any]:
+    artists = _extract_artists(item)
+    return {
+        "id": str(item.get("id") or ""),
+        "name": str(item.get("name") or "Unknown track"),
+        "album": str((item.get("album") or {}).get("name") or "Unknown album"),
+        "artists": _track_artist_payloads(artists, artist_results),
+    }
+
+
+def _wait_for_track_change(
+    spotify: SpotifyClient,
+    *,
+    previous_track_id: str,
+    timeout_seconds: float = 4.0,
+    poll_interval_seconds: float = 0.25,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout_seconds
+    latest_playback: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        latest_playback = spotify.get_current_playback()
+        latest_track_id = _playback_track_id(latest_playback or {})
+        if latest_track_id and latest_track_id != previous_track_id:
+            return latest_playback
+        time.sleep(poll_interval_seconds)
+    return latest_playback
+
+
+def _playback_track_id(playback: dict[str, Any]) -> str:
+    item = playback.get("item") or {}
+    return str(item.get("id") or "")
+
+
+def _skip_blocked_reason(playback: dict[str, Any]) -> str:
+    device = playback.get("device") or {}
+    if device.get("is_restricted"):
+        return "Current Spotify device is restricted."
+
+    disallows = (playback.get("actions") or {}).get("disallows") or {}
+    if disallows.get("skipping_next"):
+        return "Spotify says skipping to the next track is disallowed."
+
+    return ""
+
+
+def _smart_skip_limit(config: dict[str, Any]) -> int:
+    try:
+        return max(1, min(25, int(config.get("smart_skip_max_tracks", 10))))
+    except (TypeError, ValueError):
+        return 10
+
+
+def _skip_to_keep_result(
+    *,
+    status: str,
+    performed: bool,
+    skipped_count: int,
+    stopped_on: str,
+    reason: str,
+    final_track: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "action": "skip_to_keep",
+        "performed": performed,
+        "skipped_count": skipped_count,
+        "stopped_on": stopped_on,
+        "reason": reason,
+        "final_track": final_track,
+    }
 
 
 def _album_image_url(item: dict[str, Any]) -> str:
@@ -648,6 +1043,42 @@ WEB_HTML = r"""
       gap: 12px;
     }
 
+    .queue-preview {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px 18px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .queue-preview h2 {
+      margin: 0;
+      font-size: 17px;
+      line-height: 1.3;
+      letter-spacing: 0;
+    }
+
+    .queue-list {
+      margin: 0;
+      padding-left: 20px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .queue-title {
+      font-weight: 650;
+      overflow-wrap: anywhere;
+    }
+
+    .queue-meta {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+
     .artist {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -682,6 +1113,15 @@ WEB_HTML = r"""
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
+    }
+
+    .label-panel {
+      display: grid;
+      gap: 8px;
+    }
+
+    .label-panel[hidden] {
+      display: none;
     }
 
     .controls {
@@ -780,6 +1220,8 @@ WEB_HTML = r"""
     let currentTrackId = "";
     let pendingTrackChangeFromTrackId = null;
     let isSeeking = false;
+    let playerActionInFlight = false;
+    const expandedLabelArtistIds = new Set();
 
     refreshButton.addEventListener("click", () => refresh());
     coverLightbox.addEventListener("click", () => closeCoverLightbox());
@@ -790,6 +1232,9 @@ WEB_HTML = r"""
     });
 
     async function refresh() {
+      if (playerActionInFlight) {
+        return;
+      }
       if (timer) {
         clearTimeout(timer);
         timer = null;
@@ -865,7 +1310,11 @@ WEB_HTML = r"""
         return;
       }
 
-      currentTrackId = String(data.track.id || "");
+      const renderedTrackId = String(data.track.id || "");
+      if (currentTrackId && currentTrackId !== renderedTrackId) {
+        expandedLabelArtistIds.clear();
+      }
+      currentTrackId = renderedTrackId;
       const decisionClass = data.decision.would_skip ? "skip" : "keep";
       const decisionText = data.decision.would_skip ? "会跳过" : "保留";
       content.className = "";
@@ -895,6 +1344,7 @@ WEB_HTML = r"""
             <div class="controls">
               <button type="button" data-player-action="previous">Prev</button>
               <button type="button" data-player-action="next">Next</button>
+              <button class="warn" type="button" data-player-action="skip-to-keep">跳到保留</button>
               <button class="primary" type="button" data-player-action="like" data-track-id="${escapeAttr(data.track.id)}">Like</button>
             </div>
           </div>
@@ -902,6 +1352,7 @@ WEB_HTML = r"""
         <section class="grid">
           ${data.artists.map((artist) => artistHtml(artist)).join("")}
         </section>
+        ${queueHtml(data.queue)}
       `;
 
       for (const button of content.querySelectorAll("[data-label]")) {
@@ -909,6 +1360,17 @@ WEB_HTML = r"""
       }
       for (const button of content.querySelectorAll("[data-player-action]")) {
         button.addEventListener("click", () => playerAction(button));
+      }
+      for (const button of content.querySelectorAll("[data-edit-labels]")) {
+        button.addEventListener("click", () => {
+          if (button.dataset.artistId) {
+            expandedLabelArtistIds.add(button.dataset.artistId);
+          }
+          const panel = button.closest(".artist")?.querySelector("[data-label-panel]");
+          if (panel) {
+            panel.hidden = false;
+          }
+        });
       }
       const coverButton = content.querySelector("[data-cover-url]");
       if (coverButton) {
@@ -965,6 +1427,43 @@ WEB_HTML = r"""
       }).join(", ");
     }
 
+    function queueHtml(queue) {
+      const tracks = Array.isArray(queue?.tracks) ? queue.tracks : [];
+      const errorHtml = queue?.error
+        ? `<div class="status">队列预缓存失败：${escapeHtml(queue.error)}</div>`
+        : "";
+      if (!tracks.length && !errorHtml) {
+        return "";
+      }
+      return `
+        <section class="queue-preview">
+          <h2>已预缓存后续 ${tracks.length} 首</h2>
+          ${errorHtml}
+          <ol class="queue-list">
+            ${tracks.map((track) => queueTrackHtml(track)).join("")}
+          </ol>
+        </section>
+      `;
+    }
+
+    function queueTrackHtml(track) {
+      const decision = track.decision || {};
+      const decisionClass = decision.would_skip ? "skip" : "keep";
+      const decisionText = decision.would_skip ? "预判跳过" : "预判保留";
+      return `
+        <li>
+          <div class="queue-title">${escapeHtml(track.name || "Unknown track")}</div>
+          <div class="queue-meta">
+            ${trackArtistLinks(track.artists || [])}<br>
+            ${escapeHtml(track.album || "Unknown album")}
+          </div>
+          <div class="badges">
+            <span class="badge ${decisionClass}">${decisionText}: ${escapeHtml(decision.reason || "")}</span>
+          </div>
+        </li>
+      `;
+    }
+
     function artistHtml(artist) {
       const groupDetails = artist.gender === "group"
         ? `，组成：${artist.group_composition}`
@@ -989,27 +1488,30 @@ WEB_HTML = r"""
     }
 
     function labelControls(artist) {
-      const base = `
-        <div class="label-row">
-          ${button("male", "男", artist)}
-          ${button("female", "女", artist)}
-          ${button("other", "其他", artist)}
-          ${button("group", "团体", artist)}
-          ${button("unknown", "未知", artist)}
-          ${button("male", "男配乐", artist, "", "composer_or_score")}
-        </div>
-      `;
-
-      if (artist.gender !== "group") {
-        return base;
-      }
-
-      return base + `
-        <div class="label-row">
-          ${button("group", "全男团体", artist, "all_male")}
-          ${button("group", "全女团体", artist, "all_female")}
-          ${button("group", "混合团体", artist, "mixed")}
-          ${button("group", "团体未知", artist, "unknown")}
+      const shouldShowLabels = artist.needs_gender_label || artist.needs_group_composition_label;
+      const labelsExpanded = shouldShowLabels || expandedLabelArtistIds.has(artist.spotify_artist_id);
+      const groupControls = artist.gender === "group"
+        ? `
+          <div class="label-row">
+            ${button("group", "全男团体", artist, "all_male")}
+            ${button("group", "全女团体", artist, "all_female")}
+            ${button("group", "混合团体", artist, "mixed")}
+            ${button("group", "团体未知", artist, "unknown")}
+          </div>
+        `
+        : "";
+      return `
+        <button type="button" data-edit-labels data-artist-id="${escapeAttr(artist.spotify_artist_id)}" ${shouldShowLabels ? "hidden" : ""}>修改</button>
+        <div class="label-panel" data-label-panel ${labelsExpanded ? "" : "hidden"}>
+          <div class="label-row">
+            ${button("male", "男", artist)}
+            ${button("female", "女", artist)}
+            ${button("other", "其他", artist)}
+            ${button("group", "团体", artist)}
+            ${button("unknown", "未知", artist)}
+            ${button("male", "男配乐", artist, "", "composer_or_score")}
+          </div>
+          ${groupControls}
         </div>
       `;
     }
@@ -1046,6 +1548,7 @@ WEB_HTML = r"""
           const data = await response.json();
           throw new Error(data.detail || response.statusText);
         }
+        expandedLabelArtistIds.delete(payload.spotify_artist_id);
         await refresh();
       } catch (error) {
         alert(`写入失败：${error}`);
@@ -1055,18 +1558,25 @@ WEB_HTML = r"""
     }
 
     async function playerAction(button) {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
       const action = button.dataset.playerAction;
       const endpoint = action === "previous"
         ? "/api/player/previous"
         : action === "next"
           ? "/api/player/next"
-          : "/api/tracks/like";
+          : action === "skip-to-keep"
+            ? "/api/player/skip-to-keep"
+            : "/api/tracks/like";
       const payload = action === "like"
         ? { track_id: button.dataset.trackId }
         : {};
       const previousTrackId = currentTrackId;
 
       button.disabled = true;
+      playerActionInFlight = true;
       try {
         const response = await fetch(endpoint, {
           method: "POST",
@@ -1077,13 +1587,15 @@ WEB_HTML = r"""
           const data = await response.json();
           throw new Error(data.detail || response.statusText);
         }
-        if (action === "previous" || action === "next") {
+        if (action === "previous" || action === "next" || action === "skip-to-keep") {
           pendingTrackChangeFromTrackId = previousTrackId || currentTrackId || null;
         }
+        playerActionInFlight = false;
         await refresh();
       } catch (error) {
         alert(`Action failed: ${error}`);
       } finally {
+        playerActionInFlight = false;
         button.disabled = false;
       }
     }
@@ -1132,7 +1644,6 @@ WEB_HTML = r"""
     }
 
     refresh();
-    timer = setInterval(refresh, 3000);
   </script>
 </body>
 </html>

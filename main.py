@@ -44,6 +44,8 @@ DEFAULT_SCOPES = [
 
 DEFAULT_CONFIG = {
     "poll_interval_seconds": 3,
+    "queue_prefetch_tracks": 3,
+    "smart_skip_max_tracks": 10,
     "skip_if_any_artist_male": True,
     "skip_unknown": False,
     "skip_groups": False,
@@ -681,6 +683,16 @@ def load_config(path: Path) -> dict[str, Any]:
         config["poll_interval_seconds"] = max(1, float(config["poll_interval_seconds"]))
     except (TypeError, ValueError):
         config["poll_interval_seconds"] = DEFAULT_CONFIG["poll_interval_seconds"]
+
+    try:
+        config["queue_prefetch_tracks"] = max(0, min(10, int(config["queue_prefetch_tracks"])))
+    except (TypeError, ValueError):
+        config["queue_prefetch_tracks"] = DEFAULT_CONFIG["queue_prefetch_tracks"]
+
+    try:
+        config["smart_skip_max_tracks"] = max(1, min(25, int(config["smart_skip_max_tracks"])))
+    except (TypeError, ValueError):
+        config["smart_skip_max_tracks"] = DEFAULT_CONFIG["smart_skip_max_tracks"]
 
     for key in (
         "skip_if_any_artist_male",

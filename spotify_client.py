@@ -36,6 +36,20 @@ class SpotifyClient:
             print(f"Spotify returned invalid playback JSON: {exc}")
             return None
 
+    def get_queue(self) -> dict[str, Any] | None:
+        response = self._request("GET", "/me/player/queue")
+        if response is None or response.status_code == 204:
+            return None
+        if response.status_code >= 400:
+            self._print_error("queue lookup", response)
+            return None
+        try:
+            payload = response.json()
+            return payload if isinstance(payload, dict) else None
+        except ValueError as exc:
+            print(f"Spotify returned invalid queue JSON: {exc}")
+            return None
+
     def skip_to_next(self, *, device_id: str | None = None) -> bool:
         params = {"device_id": device_id} if device_id else None
         response = self._request("POST", "/me/player/next", params=params)
