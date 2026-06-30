@@ -6,6 +6,7 @@ import ipaddress
 import secrets
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import quote_plus
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
@@ -142,7 +143,7 @@ def create_web_app(
                 "name": str(item.get("name") or "Unknown track"),
                 "album": str((item.get("album") or {}).get("name") or "Unknown album"),
                 "image_url": _album_image_url(item),
-                "artists": artists,
+                "artists": _track_artist_payloads(artists, artist_results),
                 "progress_ms": playback.get("progress_ms"),
                 "duration_ms": item.get("duration_ms"),
             },
@@ -246,6 +247,7 @@ def _artist_result_payload(result: ArtistGender) -> dict[str, Any]:
     return {
         "spotify_artist_id": result.spotify_artist_id,
         "name": result.name,
+        "wiki_url": _artist_wiki_url(result.name),
         "gender": result.gender,
         "gender_label": _gender_display_label(result.gender),
         "group_composition": result.group_composition,
@@ -259,10 +261,37 @@ def _artist_result_payload(result: ArtistGender) -> dict[str, Any]:
     }
 
 
+def _track_artist_payloads(
+    spotify_artists: list[dict[str, str]],
+    artist_results: list[ArtistGender],
+) -> list[dict[str, str]]:
+    results_by_id = {result.spotify_artist_id: result for result in artist_results}
+    payloads: list[dict[str, str]] = []
+    for artist in spotify_artists:
+        spotify_artist_id = artist["id"]
+        name = artist["name"]
+        result = results_by_id.get(spotify_artist_id)
+        gender = result.gender if result else "unknown"
+        payloads.append(
+            {
+                "id": spotify_artist_id,
+                "name": name,
+                "gender": gender,
+                "gender_label": _gender_display_label(gender),
+                "wiki_url": _artist_wiki_url(name),
+            }
+        )
+    return payloads
+
+
 def _gender_display_label(gender: str) -> str:
     if gender == "other":
         return "Non-binary"
     return gender
+
+
+def _artist_wiki_url(name: str) -> str:
+    return f"https://en.wikipedia.org/wiki/Special:Search?search={quote_plus(name)}"
 
 
 def _request_is_local(request: Request) -> bool:
@@ -567,6 +596,15 @@ WEB_HTML = r"""
       overflow-wrap: anywhere;
     }
 
+    .artist-wiki-link {
+      color: var(--blue);
+      text-decoration: none;
+    }
+
+    .artist-wiki-link:hover {
+      text-decoration: underline;
+    }
+
     .badges {
       display: flex;
       flex-wrap: wrap;
@@ -828,14 +866,13 @@ WEB_HTML = r"""
           <div>
             <h2>${escapeHtml(data.track.name)}</h2>
             <div class="meta">
-              ${escapeHtml(data.artists.map((artist) => `${artist.name} (${artist.gender_label || artist.gender})`).join(", "))}<br>
+              ${trackArtistLinks(data.track.artists)}<br>
               ${escapeHtml(data.track.album)}
             </div>
             <div class="badges">
               <span class="badge ${decisionClass}">${decisionText}: ${escapeHtml(data.decision.reason)}</span>
               <span class="badge ${data.action.performed ? "skip" : "keep"}">Action: ${escapeHtml(data.action.name)}</span>
               ${data.context.liked_songs ? '<span class="badge keep">Liked Songs</span>' : ""}
-              ${data.device.name ? `<span class="badge">${escapeHtml(data.device.name)}</span>` : ""}
             </div>
             <div class="progress">
               <span id="progress-current">${formatTime(data.track.progress_ms)}</span>
@@ -907,6 +944,16 @@ WEB_HTML = r"""
       coverLightbox.classList.remove("open");
       coverLightbox.setAttribute("aria-hidden", "true");
       coverLightboxImage.removeAttribute("src");
+    }
+
+    function trackArtistLinks(artists) {
+      return artists.map((artist) => {
+        const label = `${artist.name} (${artist.gender_label || artist.gender})`;
+        if (!artist.wiki_url) {
+          return escapeHtml(label);
+        }
+        return `<a class="artist-wiki-link" href="${escapeAttr(artist.wiki_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`;
+      }).join(", ");
     }
 
     function artistHtml(artist) {
