@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from cache import ArtistGenderCache
 from gender_resolver import ArtistGender
-from web_app import create_web_app
+from web_app import WEB_HTML, create_web_app
 
 
 class FakeSpotify:
@@ -16,6 +16,7 @@ class FakeSpotify:
         self.skip_calls: list[str | None] = []
         self.previous_calls: list[str | None] = []
         self.saved_track_ids: list[str] = []
+        self.seek_positions: list[int] = []
 
     def get_current_playback(self) -> dict[str, Any] | None:
         return self.playback
@@ -30,6 +31,10 @@ class FakeSpotify:
 
     def save_track(self, track_id: str) -> bool:
         self.saved_track_ids.append(track_id)
+        return True
+
+    def seek(self, position_ms: int, *, device_id: str | None = None) -> bool:
+        self.seek_positions.append(position_ms)
         return True
 
 
@@ -69,6 +74,7 @@ def test_web_current_returns_track_and_unknown_artist(tmp_path) -> None:
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["track"]["name"] == "Song A"
+    assert payload["track"]["duration_ms"] == 180000
     assert payload["artists"][0]["gender"] == "unknown"
     assert payload["artists"][0]["gender_label"] == "unknown"
     assert payload["artists"][0]["needs_gender_label"] is True
@@ -159,6 +165,52 @@ def test_web_like_endpoint_saves_track(tmp_path) -> None:
     assert response.status_code == 200
     assert response.json()["performed"] is True
     assert spotify.saved_track_ids == ["track-1"]
+
+
+def test_web_seek_endpoint_changes_track_position(tmp_path) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+    spotify = FakeSpotify(None)
+    app = create_web_app(
+        spotify=spotify,
+        resolver=FakeResolver({}),
+        cache=cache,
+        config={},
+        should_skip_func=lambda artists, config: (False, "unused"),
+        is_liked_songs_func=lambda playback, config: False,
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/player/seek", json={"position_ms": 65000})
+
+    assert response.status_code == 200
+    assert response.json()["performed"] is True
+    assert response.json()["position_ms"] == 65000
+    assert spotify.seek_positions == [65000]
+
+
+def test_web_html_uses_adaptive_refresh_intervals() -> None:
+    assert "const NORMAL_REFRESH_MS = 3000;" in WEB_HTML
+    assert "const FAST_REFRESH_MS = 500;" in WEB_HTML
+    assert "const IMMEDIATE_REFRESH_MS = 100;" in WEB_HTML
+    assert "END_REFRESH_WINDOW_MS" in WEB_HTML
+    assert "pendingTrackChangeFromTrackId = trackId || pendingTrackChangeFromTrackId" in WEB_HTML
+    assert "setTimeout(refresh, nextRefreshDelay(data))" in WEB_HTML
+
+
+def test_web_html_has_seekable_progress_bar() -> None:
+    assert 'id="track-progress"' in WEB_HTML
+    assert 'id="progress-current"' in WEB_HTML
+    assert 'id="progress-duration"' in WEB_HTML
+    assert '"/api/player/seek"' in WEB_HTML
+    assert "function formatTime" in WEB_HTML
+    assert "isSeeking" in WEB_HTML
+
+
+def test_web_html_has_expandable_album_cover() -> None:
+    assert 'id="cover-lightbox"' in WEB_HTML
+    assert 'data-cover-url' in WEB_HTML
+    assert "openCoverLightbox" in WEB_HTML
+    assert "closeCoverLightbox" in WEB_HTML
 
 
 def test_web_current_displays_other_as_non_binary_label(tmp_path) -> None:
@@ -374,6 +426,7 @@ def _track_playback() -> dict[str, Any]:
             "id": "track-1",
             "type": "track",
             "name": "Song A",
+            "duration_ms": 180000,
             "album": {
                 "name": "Album A",
                 "images": [{"url": "https://example.test/cover.jpg"}],

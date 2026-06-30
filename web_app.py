@@ -32,6 +32,10 @@ class LikeTrackRequest(BaseModel):
     track_id: str
 
 
+class SeekRequest(BaseModel):
+    position_ms: int
+
+
 def create_web_app(
     *,
     spotify: SpotifyClient,
@@ -140,6 +144,7 @@ def create_web_app(
                 "image_url": _album_image_url(item),
                 "artists": artists,
                 "progress_ms": playback.get("progress_ms"),
+                "duration_ms": item.get("duration_ms"),
             },
             "device": {
                 "name": str(device.get("name") or ""),
@@ -193,6 +198,17 @@ def create_web_app(
         ok = spotify.skip_to_previous()
         app.state.last_skip_attempt_track_id = None
         return {"status": "ok" if ok else "error", "action": "previous", "performed": ok}
+
+    @app.post("/api/player/seek")
+    def seek_track(payload: SeekRequest) -> dict[str, Any]:
+        position_ms = max(0, int(payload.position_ms))
+        ok = spotify.seek(position_ms)
+        return {
+            "status": "ok" if ok else "error",
+            "action": "seek",
+            "performed": ok,
+            "position_ms": position_ms,
+        }
 
     @app.post("/api/tracks/like")
     def like_track(payload: LikeTrackRequest) -> dict[str, Any]:
@@ -498,6 +514,44 @@ WEB_HTML = r"""
       object-fit: cover;
     }
 
+    .cover-button {
+      width: 136px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      border-radius: 6px;
+      cursor: zoom-in;
+    }
+
+    .cover-button:focus-visible {
+      outline: 3px solid rgba(22, 122, 91, 0.35);
+      outline-offset: 3px;
+    }
+
+    .cover-lightbox {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(10, 14, 20, 0.88);
+      z-index: 50;
+      cursor: zoom-out;
+    }
+
+    .cover-lightbox.open {
+      display: flex;
+    }
+
+    .cover-lightbox img {
+      max-width: min(94vw, 94vh);
+      max-height: 94vh;
+      border-radius: 8px;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
+      object-fit: contain;
+    }
+
     .track h2 {
       margin: 0 0 8px;
       font-size: 26px;
@@ -590,6 +644,22 @@ WEB_HTML = r"""
       margin-top: 14px;
     }
 
+    .progress {
+      display: grid;
+      grid-template-columns: 48px minmax(120px, 1fr) 48px;
+      align-items: center;
+      gap: 10px;
+      margin-top: 14px;
+      color: var(--muted);
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .progress input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent);
+    }
+
     .empty,
     .error {
       padding: 18px;
@@ -624,6 +694,10 @@ WEB_HTML = r"""
         width: 82px;
       }
 
+      .cover-button {
+        width: 82px;
+      }
+
       .track h2 {
         font-size: 20px;
       }
@@ -641,26 +715,100 @@ WEB_HTML = r"""
     </header>
     <section id="content" class="empty">正在读取 Spotify 播放状态。</section>
   </main>
+  <div id="cover-lightbox" class="cover-lightbox" aria-hidden="true">
+    <img id="cover-lightbox-image" alt="">
+  </div>
 
   <script>
     const content = document.getElementById("content");
     const updated = document.getElementById("updated");
     const refreshButton = document.getElementById("refresh");
+    const coverLightbox = document.getElementById("cover-lightbox");
+    const coverLightboxImage = document.getElementById("cover-lightbox-image");
+    const NORMAL_REFRESH_MS = 3000;
+    const FAST_REFRESH_MS = 500;
+    const IMMEDIATE_REFRESH_MS = 100;
+    const END_REFRESH_WINDOW_MS = 10000;
     let timer = null;
+    let currentTrackId = "";
+    let pendingTrackChangeFromTrackId = null;
+    let isSeeking = false;
 
     refreshButton.addEventListener("click", () => refresh());
+    coverLightbox.addEventListener("click", () => closeCoverLightbox());
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        closeCoverLightbox();
+      }
+    });
 
     async function refresh() {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (isSeeking) {
+        timer = setTimeout(refresh, FAST_REFRESH_MS);
+        return;
+      }
+      let data = null;
       try {
         const response = await fetch("/api/current", { cache: "no-store" });
-        const data = await response.json();
+        data = await response.json();
         render(data);
       } catch (error) {
         content.className = "error";
         content.textContent = `读取失败：${error}`;
       } finally {
         updated.textContent = new Date().toLocaleTimeString();
+        scheduleNextRefresh(data);
       }
+    }
+
+    function scheduleNextRefresh(data) {
+      timer = setTimeout(refresh, nextRefreshDelay(data));
+    }
+
+    function nextRefreshDelay(data) {
+      if (!data || data.status !== "ok") {
+        return NORMAL_REFRESH_MS;
+      }
+
+      const trackId = String(data.track?.id || "");
+      const progressMs = Number(data.track?.progress_ms || 0);
+      const durationMs = Number(data.track?.duration_ms || 0);
+      const actionName = String(data.action?.name || "");
+      const actionPerformed = Boolean(data.action?.performed);
+      const timeUntilEndMs = durationMs > 0 && progressMs >= 0
+        ? durationMs - progressMs
+        : null;
+      const nearTrackEnd = durationMs > 0
+        && progressMs >= 0
+        && timeUntilEndMs <= END_REFRESH_WINDOW_MS;
+      const waitingForManualTrackChange = Boolean(pendingTrackChangeFromTrackId)
+        && trackId === pendingTrackChangeFromTrackId;
+
+      if (pendingTrackChangeFromTrackId && trackId && trackId !== pendingTrackChangeFromTrackId) {
+        pendingTrackChangeFromTrackId = null;
+      }
+
+      if (actionPerformed && ["skip", "next", "previous"].includes(actionName)) {
+        pendingTrackChangeFromTrackId = trackId || pendingTrackChangeFromTrackId;
+        return IMMEDIATE_REFRESH_MS;
+      }
+
+      if (nearTrackEnd || waitingForManualTrackChange || actionName === "already_processed") {
+        return FAST_REFRESH_MS;
+      }
+
+      if (timeUntilEndMs !== null && timeUntilEndMs > END_REFRESH_WINDOW_MS) {
+        return Math.min(
+          NORMAL_REFRESH_MS,
+          Math.max(FAST_REFRESH_MS, timeUntilEndMs - END_REFRESH_WINDOW_MS),
+        );
+      }
+
+      return NORMAL_REFRESH_MS;
     }
 
     function render(data) {
@@ -670,6 +818,7 @@ WEB_HTML = r"""
         return;
       }
 
+      currentTrackId = String(data.track.id || "");
       const decisionClass = data.decision.would_skip ? "skip" : "keep";
       const decisionText = data.decision.would_skip ? "会跳过" : "保留";
       content.className = "";
@@ -687,6 +836,15 @@ WEB_HTML = r"""
               <span class="badge ${data.action.performed ? "skip" : "keep"}">Action: ${escapeHtml(data.action.name)}</span>
               ${data.context.liked_songs ? '<span class="badge keep">Liked Songs</span>' : ""}
               ${data.device.name ? `<span class="badge">${escapeHtml(data.device.name)}</span>` : ""}
+            </div>
+            <div class="progress">
+              <span id="progress-current">${formatTime(data.track.progress_ms)}</span>
+              <input id="track-progress" type="range" min="0"
+                max="${Number(data.track.duration_ms || 0)}"
+                value="${Number(data.track.progress_ms || 0)}"
+                step="1000"
+                ${Number(data.track.duration_ms || 0) > 0 ? "" : "disabled"}>
+              <span id="progress-duration">${formatTime(data.track.duration_ms)}</span>
             </div>
             <div class="controls">
               <button type="button" data-player-action="previous">Prev</button>
@@ -706,13 +864,49 @@ WEB_HTML = r"""
       for (const button of content.querySelectorAll("[data-player-action]")) {
         button.addEventListener("click", () => playerAction(button));
       }
+      const coverButton = content.querySelector("[data-cover-url]");
+      if (coverButton) {
+        coverButton.addEventListener("click", () => {
+          openCoverLightbox(coverButton.dataset.coverUrl || "");
+        });
+      }
+      const progressInput = content.querySelector("#track-progress");
+      if (progressInput) {
+        progressInput.addEventListener("input", () => {
+          isSeeking = true;
+          const current = content.querySelector("#progress-current");
+          if (current) {
+            current.textContent = formatTime(progressInput.value);
+          }
+        });
+        progressInput.addEventListener("change", () => seekTrack(progressInput));
+      }
     }
 
     function coverHtml(url) {
       if (!url) {
         return '<div class="cover"></div>';
       }
-      return `<img class="cover" src="${escapeAttr(url)}" alt="">`;
+      return `
+        <button class="cover-button" type="button" data-cover-url="${escapeAttr(url)}" aria-label="Expand album cover">
+          <img class="cover" src="${escapeAttr(url)}" alt="">
+        </button>
+      `;
+    }
+
+    function openCoverLightbox(url) {
+      if (!url) {
+        return;
+      }
+      coverLightboxImage.src = url;
+      coverLightbox.classList.add("open");
+      coverLightbox.setAttribute("aria-hidden", "false");
+    }
+
+    function closeCoverLightbox() {
+      coverLightbox.classList.remove("open");
+      coverLightbox.setAttribute("aria-hidden", "true");
+      coverLightboxImage.removeAttribute("src");
     }
 
     function artistHtml(artist) {
@@ -814,6 +1008,7 @@ WEB_HTML = r"""
       const payload = action === "like"
         ? { track_id: button.dataset.trackId }
         : {};
+      const previousTrackId = currentTrackId;
 
       button.disabled = true;
       try {
@@ -826,13 +1021,45 @@ WEB_HTML = r"""
           const data = await response.json();
           throw new Error(data.detail || response.statusText);
         }
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        if (action === "previous" || action === "next") {
+          pendingTrackChangeFromTrackId = previousTrackId || currentTrackId || null;
+        }
         await refresh();
       } catch (error) {
         alert(`Action failed: ${error}`);
       } finally {
         button.disabled = false;
       }
+    }
+
+    async function seekTrack(input) {
+      const positionMs = Math.max(0, Number(input.value || 0));
+      input.disabled = true;
+      try {
+        const response = await fetch("/api/player/seek", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ position_ms: Math.round(positionMs) }),
+        });
+        if (!response.ok) {
+          const data = await response.json();
+          throw new Error(data.detail || response.statusText);
+        }
+        isSeeking = false;
+        await refresh();
+      } catch (error) {
+        alert(`Seek failed: ${error}`);
+      } finally {
+        isSeeking = false;
+        input.disabled = false;
+      }
+    }
+
+    function formatTime(valueMs) {
+      const totalSeconds = Math.max(0, Math.floor(Number(valueMs || 0) / 1000));
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      return `${minutes}:${String(seconds).padStart(2, "0")}`;
     }
 
     function escapeHtml(value) {

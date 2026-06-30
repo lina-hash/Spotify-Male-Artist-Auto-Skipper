@@ -71,6 +71,20 @@ class SpotifyClient:
             print("Hint: liking tracks requires the user-library-modify scope.")
         return False
 
+    def seek(self, position_ms: int, *, device_id: str | None = None) -> bool:
+        params: dict[str, Any] = {"position_ms": max(0, int(position_ms))}
+        if device_id:
+            params["device_id"] = device_id
+        response = self._request("PUT", "/me/player/seek", params=params)
+        if response is None:
+            return False
+        if response.status_code in {200, 202, 204}:
+            return True
+        self._print_error("seek", response)
+        if response.status_code == 403:
+            print("Hint: Spotify requires Premium for playback control endpoints.")
+        return False
+
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response | None:
         url = f"{self.base_url}{path}"
         headers_from_caller = dict(kwargs.pop("headers", {}) or {})

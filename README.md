@@ -105,7 +105,7 @@ python main.py web
 http://127.0.0.1:8890
 ```
 
-网页会显示当前播放歌曲、专辑、artist 判断结果和当前规则下是否会跳过。Web 模式默认也会主动调用 Spotify 跳过接口；同一首歌只会处理一次，避免页面刷新导致重复跳过。网页里也提供 `Prev`、`Next` 和 `Like` 按钮，用于上一首、下一首和把当前歌曲加入 Liked Songs。遇到 `unknown` artist 时，可以直接点击按钮标记为男、女、其他、团体或未知。按钮会写入本地 `artist_gender_cache.json`，之后命令行自动跳过流程也会使用同一份缓存。
+网页会显示当前播放歌曲、专辑、artist 判断结果和当前规则下是否会跳过。Web 模式默认也会主动调用 Spotify 跳过接口；同一首歌只会处理一次，避免页面刷新导致重复跳过。网页里也提供进度条、当前时间、总时长、`Prev`、`Next` 和 `Like` 按钮，用于拖动歌曲进度、上一首、下一首和把当前歌曲加入 Liked Songs。遇到 `unknown` artist 时，可以直接点击按钮标记为男、女、其他、团体或未知。按钮会写入本地 `artist_gender_cache.json`，之后命令行自动跳过流程也会使用同一份缓存。
 
 `Like` 按钮需要 Spotify 授权 scope `user-library-modify`。如果你之前已经登录过，旧的 `token_cache.json` 可能没有这个 scope；遇到喜欢失败时，删除 `token_cache.json` 后重新运行并授权一次。
 
