@@ -28,6 +28,10 @@ class LabelRequest(BaseModel):
     artist_role: str | None = None
 
 
+class LikeTrackRequest(BaseModel):
+    track_id: str
+
+
 def create_web_app(
     *,
     spotify: SpotifyClient,
@@ -178,6 +182,26 @@ def create_web_app(
             },
         }
 
+    @app.post("/api/player/next")
+    def next_track() -> dict[str, Any]:
+        ok = spotify.skip_to_next()
+        app.state.last_skip_attempt_track_id = None
+        return {"status": "ok" if ok else "error", "action": "next", "performed": ok}
+
+    @app.post("/api/player/previous")
+    def previous_track() -> dict[str, Any]:
+        ok = spotify.skip_to_previous()
+        app.state.last_skip_attempt_track_id = None
+        return {"status": "ok" if ok else "error", "action": "previous", "performed": ok}
+
+    @app.post("/api/tracks/like")
+    def like_track(payload: LikeTrackRequest) -> dict[str, Any]:
+        track_id = payload.track_id.strip()
+        if not track_id:
+            raise HTTPException(status_code=400, detail="track_id is required")
+        ok = spotify.save_track(track_id)
+        return {"status": "ok" if ok else "error", "action": "like", "performed": ok}
+
     return app
 
 
@@ -221,7 +245,7 @@ def _artist_result_payload(result: ArtistGender) -> dict[str, Any]:
 
 def _gender_display_label(gender: str) -> str:
     if gender == "other":
-        return "Non-binary / other"
+        return "Non-binary"
     return gender
 
 
@@ -559,6 +583,13 @@ WEB_HTML = r"""
       gap: 8px;
     }
 
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
     .empty,
     .error {
       padding: 18px;
@@ -648,7 +679,7 @@ WEB_HTML = r"""
           <div>
             <h2>${escapeHtml(data.track.name)}</h2>
             <div class="meta">
-              ${escapeHtml(data.track.artists.map((artist) => artist.name).join(", "))}<br>
+              ${escapeHtml(data.artists.map((artist) => `${artist.name} (${artist.gender_label || artist.gender})`).join(", "))}<br>
               ${escapeHtml(data.track.album)}
             </div>
             <div class="badges">
@@ -656,6 +687,11 @@ WEB_HTML = r"""
               <span class="badge ${data.action.performed ? "skip" : "keep"}">Action: ${escapeHtml(data.action.name)}</span>
               ${data.context.liked_songs ? '<span class="badge keep">Liked Songs</span>' : ""}
               ${data.device.name ? `<span class="badge">${escapeHtml(data.device.name)}</span>` : ""}
+            </div>
+            <div class="controls">
+              <button type="button" data-player-action="previous">Prev</button>
+              <button type="button" data-player-action="next">Next</button>
+              <button class="primary" type="button" data-player-action="like" data-track-id="${escapeAttr(data.track.id)}">Like</button>
             </div>
           </div>
         </section>
@@ -666,6 +702,9 @@ WEB_HTML = r"""
 
       for (const button of content.querySelectorAll("[data-label]")) {
         button.addEventListener("click", () => labelArtist(button));
+      }
+      for (const button of content.querySelectorAll("[data-player-action]")) {
+        button.addEventListener("click", () => playerAction(button));
       }
     }
 
@@ -760,6 +799,37 @@ WEB_HTML = r"""
         await refresh();
       } catch (error) {
         alert(`写入失败：${error}`);
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function playerAction(button) {
+      const action = button.dataset.playerAction;
+      const endpoint = action === "previous"
+        ? "/api/player/previous"
+        : action === "next"
+          ? "/api/player/next"
+          : "/api/tracks/like";
+      const payload = action === "like"
+        ? { track_id: button.dataset.trackId }
+        : {};
+
+      button.disabled = true;
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          const data = await response.json();
+          throw new Error(data.detail || response.statusText);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        await refresh();
+      } catch (error) {
+        alert(`Action failed: ${error}`);
       } finally {
         button.disabled = false;
       }

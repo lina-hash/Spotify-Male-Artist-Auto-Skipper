@@ -14,7 +14,7 @@
 - 本地 `artist_gender_cache.json` 优先，缓存缺失时先查 MusicBrainz，再用 Wikidata 兜底。
 - 团体/乐队会尽量判断成员性别组成，例如 `all_male`、`all_female`、`mixed`。
 - 支持手动标记 artist gender，也支持运行时提示标记 unknown artist 和 unknown 团体组成。
-- 支持本地网页客户端，显示当前播放信息，并用按钮修正 unknown artist。
+- 支持本地网页客户端，显示当前播放信息，控制上一首/下一首/喜欢歌曲，并用按钮修正 unknown artist。
 - 支持 `dry_run`，只打印判断结果，不真的跳过。
 
 ## 创建 Spotify App
@@ -105,7 +105,9 @@ python main.py web
 http://127.0.0.1:8890
 ```
 
-网页会显示当前播放歌曲、专辑、artist 判断结果和当前规则下是否会跳过。Web 模式默认也会主动调用 Spotify 跳过接口；同一首歌只会处理一次，避免页面刷新导致重复跳过。遇到 `unknown` artist 时，可以直接点击按钮标记为男、女、其他、团体或未知。按钮会写入本地 `artist_gender_cache.json`，之后命令行自动跳过流程也会使用同一份缓存。
+网页会显示当前播放歌曲、专辑、artist 判断结果和当前规则下是否会跳过。Web 模式默认也会主动调用 Spotify 跳过接口；同一首歌只会处理一次，避免页面刷新导致重复跳过。网页里也提供 `Prev`、`Next` 和 `Like` 按钮，用于上一首、下一首和把当前歌曲加入 Liked Songs。遇到 `unknown` artist 时，可以直接点击按钮标记为男、女、其他、团体或未知。按钮会写入本地 `artist_gender_cache.json`，之后命令行自动跳过流程也会使用同一份缓存。
+
+`Like` 按钮需要 Spotify 授权 scope `user-library-modify`。如果你之前已经登录过，旧的 `token_cache.json` 可能没有这个 scope；遇到喜欢失败时，删除 `token_cache.json` 后重新运行并授权一次。
 
 如果不想自动打开浏览器：
 

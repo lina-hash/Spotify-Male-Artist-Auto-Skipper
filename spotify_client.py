@@ -48,6 +48,29 @@ class SpotifyClient:
             print("Hint: Spotify requires Premium for playback control endpoints.")
         return False
 
+    def skip_to_previous(self, *, device_id: str | None = None) -> bool:
+        params = {"device_id": device_id} if device_id else None
+        response = self._request("POST", "/me/player/previous", params=params)
+        if response is None:
+            return False
+        if response.status_code in {200, 202, 204}:
+            return True
+        self._print_error("skip to previous", response)
+        if response.status_code == 403:
+            print("Hint: Spotify requires Premium for playback control endpoints.")
+        return False
+
+    def save_track(self, track_id: str) -> bool:
+        response = self._request("PUT", "/me/tracks", params={"ids": track_id})
+        if response is None:
+            return False
+        if response.status_code in {200, 202, 204}:
+            return True
+        self._print_error("save track", response)
+        if response.status_code in {401, 403}:
+            print("Hint: liking tracks requires the user-library-modify scope.")
+        return False
+
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response | None:
         url = f"{self.base_url}{path}"
         headers_from_caller = dict(kwargs.pop("headers", {}) or {})

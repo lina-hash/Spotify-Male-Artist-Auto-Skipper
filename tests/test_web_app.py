@@ -14,12 +14,22 @@ class FakeSpotify:
     def __init__(self, playback: dict[str, Any] | None) -> None:
         self.playback = playback
         self.skip_calls: list[str | None] = []
+        self.previous_calls: list[str | None] = []
+        self.saved_track_ids: list[str] = []
 
     def get_current_playback(self) -> dict[str, Any] | None:
         return self.playback
 
     def skip_to_next(self, *, device_id: str | None = None) -> bool:
         self.skip_calls.append(device_id)
+        return True
+
+    def skip_to_previous(self, *, device_id: str | None = None) -> bool:
+        self.previous_calls.append(device_id)
+        return True
+
+    def save_track(self, track_id: str) -> bool:
+        self.saved_track_ids.append(track_id)
         return True
 
 
@@ -60,6 +70,7 @@ def test_web_current_returns_track_and_unknown_artist(tmp_path) -> None:
     assert payload["status"] == "ok"
     assert payload["track"]["name"] == "Song A"
     assert payload["artists"][0]["gender"] == "unknown"
+    assert payload["artists"][0]["gender_label"] == "unknown"
     assert payload["artists"][0]["needs_gender_label"] is True
     assert payload["action"]["name"] == "keep"
 
@@ -90,6 +101,66 @@ def test_web_label_writes_manual_cache(tmp_path) -> None:
     assert cache.get("artist-1")["source"] == "manual"
 
 
+def test_web_next_endpoint_skips_to_next_track(tmp_path) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+    spotify = FakeSpotify(None)
+    app = create_web_app(
+        spotify=spotify,
+        resolver=FakeResolver({}),
+        cache=cache,
+        config={},
+        should_skip_func=lambda artists, config: (False, "unused"),
+        is_liked_songs_func=lambda playback, config: False,
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/player/next")
+
+    assert response.status_code == 200
+    assert response.json()["performed"] is True
+    assert spotify.skip_calls == [None]
+
+
+def test_web_previous_endpoint_skips_to_previous_track(tmp_path) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+    spotify = FakeSpotify(None)
+    app = create_web_app(
+        spotify=spotify,
+        resolver=FakeResolver({}),
+        cache=cache,
+        config={},
+        should_skip_func=lambda artists, config: (False, "unused"),
+        is_liked_songs_func=lambda playback, config: False,
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/player/previous")
+
+    assert response.status_code == 200
+    assert response.json()["performed"] is True
+    assert spotify.previous_calls == [None]
+
+
+def test_web_like_endpoint_saves_track(tmp_path) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+    spotify = FakeSpotify(None)
+    app = create_web_app(
+        spotify=spotify,
+        resolver=FakeResolver({}),
+        cache=cache,
+        config={},
+        should_skip_func=lambda artists, config: (False, "unused"),
+        is_liked_songs_func=lambda playback, config: False,
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/tracks/like", json={"track_id": "track-1"})
+
+    assert response.status_code == 200
+    assert response.json()["performed"] is True
+    assert spotify.saved_track_ids == ["track-1"]
+
+
 def test_web_current_displays_other_as_non_binary_label(tmp_path) -> None:
     cache = ArtistGenderCache(tmp_path / "cache.json")
     app = create_web_app(
@@ -117,7 +188,7 @@ def test_web_current_displays_other_as_non_binary_label(tmp_path) -> None:
     assert response.status_code == 200
     artist = response.json()["artists"][0]
     assert artist["gender"] == "other"
-    assert artist["gender_label"] == "Non-binary / other"
+    assert artist["gender_label"] == "Non-binary"
 
 
 def test_web_remote_request_requires_auth_when_password_is_set(tmp_path) -> None:
