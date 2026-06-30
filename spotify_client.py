@@ -74,16 +74,79 @@ class SpotifyClient:
             print("Hint: Spotify requires Premium for playback control endpoints.")
         return False
 
-    def save_track(self, track_id: str) -> bool:
-        response = self._request("PUT", "/me/tracks", params={"ids": track_id})
+    def start_playback(self, *, device_id: str | None = None) -> bool:
+        params = {"device_id": device_id} if device_id else None
+        response = self._request("PUT", "/me/player/play", params=params)
         if response is None:
             return False
         if response.status_code in {200, 202, 204}:
             return True
-        self._print_error("save track", response)
+        self._print_error("start playback", response)
+        if response.status_code == 403:
+            print("Hint: Spotify requires Premium for playback control endpoints.")
+        return False
+
+    def pause_playback(self, *, device_id: str | None = None) -> bool:
+        params = {"device_id": device_id} if device_id else None
+        response = self._request("PUT", "/me/player/pause", params=params)
+        if response is None:
+            return False
+        if response.status_code in {200, 202, 204}:
+            return True
+        self._print_error("pause playback", response)
+        if response.status_code == 403:
+            print("Hint: Spotify requires Premium for playback control endpoints.")
+        return False
+
+    def save_track(self, track_id: str) -> bool:
+        response = self._request(
+            "PUT",
+            "/me/library",
+            params={"uris": f"spotify:track:{track_id}"},
+        )
+        if response is None:
+            return False
+        if response.status_code in {200, 202, 204}:
+            return True
+        self._print_error("save track to library", response)
         if response.status_code in {401, 403}:
             print("Hint: liking tracks requires the user-library-modify scope.")
         return False
+
+    def remove_track(self, track_id: str) -> bool:
+        response = self._request(
+            "DELETE",
+            "/me/library",
+            params={"uris": f"spotify:track:{track_id}"},
+        )
+        if response is None:
+            return False
+        if response.status_code in {200, 202, 204}:
+            return True
+        self._print_error("remove track from library", response)
+        if response.status_code in {401, 403}:
+            print("Hint: unliking tracks requires the user-library-modify scope.")
+        return False
+
+    def is_track_saved(self, track_id: str) -> bool:
+        response = self._request(
+            "GET",
+            "/me/library/contains",
+            params={"uris": f"spotify:track:{track_id}"},
+        )
+        if response is None:
+            return False
+        if response.status_code >= 400:
+            self._print_error("check saved track", response)
+            if response.status_code in {401, 403}:
+                print("Hint: reading liked track state requires the user-library-read scope.")
+            return False
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            print(f"Spotify returned invalid saved-track JSON: {exc}")
+            return False
+        return bool(payload[0]) if isinstance(payload, list) and payload else False
 
     def seek(self, position_ms: int, *, device_id: str | None = None) -> bool:
         params: dict[str, Any] = {"position_ms": max(0, int(position_ms))}

@@ -38,6 +38,7 @@ DEFAULT_SCOPES = [
     "user-read-currently-playing",
     "user-read-playback-state",
     "user-modify-playback-state",
+    "user-library-read",
     "user-library-modify",
 ]
 
@@ -246,6 +247,12 @@ def run_web_client(args: argparse.Namespace) -> int:
     spotify = SpotifyClient(auth)
     cache = ArtistGenderCache(getattr(args, "cache", "artist_gender_cache.json"))
     resolver = GenderResolver(cache, user_agent=user_agent)
+    print("Checking Spotify authorization...")
+    try:
+        auth.get_access_token()
+    except Exception:
+        resolver.close()
+        raise
 
     host = str(getattr(args, "host", "127.0.0.1"))
     port = int(getattr(args, "port", 8890))

@@ -25,6 +25,7 @@ DEFAULT_SCOPES = [
     "user-read-currently-playing",
     "user-read-playback-state",
     "user-modify-playback-state",
+    "user-library-read",
     "user-library-modify",
 ]
 
@@ -42,12 +43,20 @@ class SpotifyPKCEAuth:
         self.redirect_uri = redirect_uri
         self.scopes = scopes or DEFAULT_SCOPES
         self.token_cache_path = Path(token_cache_path)
+        self._token_lock = threading.Lock()
 
         if not self.client_id:
             raise ValueError("SPOTIFY_CLIENT_ID is required.")
 
     def get_access_token(self, *, force_refresh: bool = False) -> str:
+        with self._token_lock:
+            return self._get_access_token_unlocked(force_refresh=force_refresh)
+
+    def _get_access_token_unlocked(self, *, force_refresh: bool = False) -> str:
         token = self._load_token()
+        if token and not self._has_required_scopes(token):
+            print("Spotify token cache is missing required scopes; reauthorizing.")
+            token = {}
 
         if (
             not force_refresh
@@ -141,9 +150,15 @@ class SpotifyPKCEAuth:
 
     def _save_token(self, token: dict[str, Any]) -> None:
         self.token_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        token = dict(token)
+        token["requested_scopes"] = list(self.scopes)
         tmp_path = self.token_cache_path.with_suffix(self.token_cache_path.suffix + ".tmp")
         tmp_path.write_text(json.dumps(token, indent=2), encoding="utf-8")
         tmp_path.replace(self.token_cache_path)
+
+    def _has_required_scopes(self, token: dict[str, Any]) -> bool:
+        granted_scopes = _token_scope_set(token)
+        return set(self.scopes).issubset(granted_scopes)
 
     @staticmethod
     def _is_expired(token: dict[str, Any], skew_seconds: int = 60) -> bool:
@@ -229,6 +244,18 @@ def _with_expiry(token: dict[str, Any]) -> dict[str, Any]:
     expires_in = int(token.get("expires_in") or 3600)
     token["expires_at"] = time.time() + expires_in
     return token
+
+
+def _token_scope_set(token: dict[str, Any]) -> set[str]:
+    raw_scope = token.get("scope")
+    if isinstance(raw_scope, str) and raw_scope.strip():
+        return {scope.strip() for scope in raw_scope.split() if scope.strip()}
+
+    raw_requested_scopes = token.get("requested_scopes")
+    if isinstance(raw_requested_scopes, list):
+        return {str(scope).strip() for scope in raw_requested_scopes if str(scope).strip()}
+
+    return set()
 
 
 def _put_once(queue: Queue[tuple[str, str]], item: tuple[str, str]) -> None:

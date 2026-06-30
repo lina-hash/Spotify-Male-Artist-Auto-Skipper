@@ -32,6 +32,7 @@ class LabelRequest(BaseModel):
 
 class LikeTrackRequest(BaseModel):
     track_id: str
+    is_liked: bool = False
 
 
 class SeekRequest(BaseModel):
@@ -55,6 +56,7 @@ def create_web_app(
     app = FastAPI(title="Spotify Male Artist Auto Skipper")
     app.state.last_skip_attempt_track_id = None
     app.state.smart_keep_track_id = None
+    app.state.smart_skip_guard_until = 0.0
 
     @app.middleware("http")
     async def require_remote_auth(request: Request, call_next: Callable[..., Any]):
@@ -90,12 +92,13 @@ def create_web_app(
             _log_verbose_status(payload, verbose)
             return payload
 
-        if not playback.get("is_playing"):
+        is_playing = bool(playback.get("is_playing"))
+        item = playback.get("item") or {}
+        if not is_playing and not item:
             payload = {"status": "paused", "message": "Spotify is paused or not playing."}
             _log_verbose_status(payload, verbose)
             return payload
 
-        item = playback.get("item") or {}
         if playback.get("currently_playing_type") != "track" or item.get("type") != "track":
             payload = {
                 "status": "not_track",
@@ -109,28 +112,37 @@ def create_web_app(
         artist_results = _resolve_artists(resolver, artists)
 
         liked_songs = is_liked_songs_func(playback, config)
-        if liked_songs:
+        if not is_playing:
+            would_skip, reason = False, "Spotify is paused"
+        elif liked_songs:
             would_skip, reason = False, "Liked Songs source is exempt"
         else:
             would_skip, reason = should_skip_func(artist_results, config)
         track_id = str(item.get("id") or "")
         smart_keep_track_id = getattr(app.state, "smart_keep_track_id", None)
-        if smart_keep_track_id and smart_keep_track_id != track_id:
-            app.state.smart_keep_track_id = None
-        elif smart_keep_track_id == track_id and would_skip:
+        smart_skip_guard_active = time.monotonic() < float(
+            getattr(app.state, "smart_skip_guard_until", 0.0) or 0.0
+        )
+        if smart_keep_track_id == track_id:
             would_skip, reason = False, "Smart skip stopped on this cached keep track"
+        elif smart_skip_guard_active and would_skip:
+            would_skip, reason = False, "Smart skip guard is active"
+        track_is_liked = _safe_is_track_saved(spotify, track_id)
 
         device = playback.get("device") or {}
-        action = _apply_skip_decision(
-            spotify=spotify,
-            playback=playback,
-            track_id=track_id,
-            would_skip=would_skip,
-            reason=reason,
-            config=config,
-            enable_skip=enable_skip,
-            state=app.state,
-        )
+        if is_playing:
+            action = _apply_skip_decision(
+                spotify=spotify,
+                playback=playback,
+                track_id=track_id,
+                would_skip=would_skip,
+                reason=reason,
+                config=config,
+                enable_skip=enable_skip,
+                state=app.state,
+            )
+        else:
+            action = {"name": "paused", "performed": False, "reason": reason}
         queue = _queue_prefetch_payload(
             spotify=spotify,
             resolver=resolver,
@@ -147,6 +159,8 @@ def create_web_app(
                 "artists": _track_artist_payloads(artists, artist_results),
                 "progress_ms": playback.get("progress_ms"),
                 "duration_ms": item.get("duration_ms"),
+                "is_playing": is_playing,
+                "is_liked": track_is_liked,
             },
             "device": {
                 "name": str(device.get("name") or ""),
@@ -195,12 +209,14 @@ def create_web_app(
         ok = spotify.skip_to_next()
         app.state.last_skip_attempt_track_id = None
         app.state.smart_keep_track_id = None
+        app.state.smart_skip_guard_until = 0.0
         return {"status": "ok" if ok else "error", "action": "next", "performed": ok}
 
     @app.post("/api/player/skip-to-keep")
     def skip_to_keep() -> dict[str, Any]:
         app.state.last_skip_attempt_track_id = None
         app.state.smart_keep_track_id = None
+        app.state.smart_skip_guard_until = time.monotonic() + 10.0
         result = _skip_to_keep(
             spotify=spotify,
             cache=cache,
@@ -211,6 +227,8 @@ def create_web_app(
         final_track = result.get("final_track")
         if result.get("stopped_on") == "keep" and isinstance(final_track, dict):
             app.state.smart_keep_track_id = final_track.get("id")
+        elif result.get("status") != "ok":
+            app.state.smart_skip_guard_until = 0.0
         return result
 
     @app.post("/api/player/previous")
@@ -218,7 +236,37 @@ def create_web_app(
         ok = spotify.skip_to_previous()
         app.state.last_skip_attempt_track_id = None
         app.state.smart_keep_track_id = None
+        app.state.smart_skip_guard_until = 0.0
         return {"status": "ok" if ok else "error", "action": "previous", "performed": ok}
+
+    @app.post("/api/player/toggle-playback")
+    def toggle_playback() -> dict[str, Any]:
+        playback = spotify.get_current_playback()
+        if not playback:
+            return {
+                "status": "error",
+                "action": "toggle_playback",
+                "performed": False,
+                "reason": "No active Spotify playback.",
+            }
+
+        device_id = str((playback.get("device") or {}).get("id") or "") or None
+        if playback.get("is_playing"):
+            ok = spotify.pause_playback(device_id=device_id)
+            return {
+                "status": "ok" if ok else "error",
+                "action": "pause",
+                "performed": ok,
+                "is_playing": False if ok else True,
+            }
+
+        ok = spotify.start_playback(device_id=device_id)
+        return {
+            "status": "ok" if ok else "error",
+            "action": "play",
+            "performed": ok,
+            "is_playing": True if ok else False,
+        }
 
     @app.post("/api/player/seek")
     def seek_track(payload: SeekRequest) -> dict[str, Any]:
@@ -236,8 +284,21 @@ def create_web_app(
         track_id = payload.track_id.strip()
         if not track_id:
             raise HTTPException(status_code=400, detail="track_id is required")
+        if payload.is_liked:
+            ok = spotify.remove_track(track_id)
+            return {
+                "status": "ok" if ok else "error",
+                "action": "unlike",
+                "performed": ok,
+                "is_liked": False if ok else True,
+            }
         ok = spotify.save_track(track_id)
-        return {"status": "ok" if ok else "error", "action": "like", "performed": ok}
+        return {
+            "status": "ok" if ok else "error",
+            "action": "like",
+            "performed": ok,
+            "is_liked": True if ok else False,
+        }
 
     return app
 
@@ -250,6 +311,16 @@ def _extract_artists(item: dict[str, Any]) -> list[dict[str, str]]:
         if spotify_id and name:
             artists.append({"id": str(spotify_id), "name": str(name)})
     return artists
+
+
+def _safe_is_track_saved(spotify: SpotifyClient, track_id: str) -> bool:
+    if not track_id:
+        return False
+    try:
+        return bool(spotify.is_track_saved(track_id))
+    except Exception as exc:
+        print(f"Spotify saved-track lookup failed: {exc}")
+        return False
 
 
 def _resolve_artists(
@@ -851,6 +922,8 @@ WEB_HTML = r"""
       --danger: #b53737;
       --warn: #8a6414;
       --blue: #2d5fa8;
+      --pink: #d63384;
+      --pink-ink: #ffffff;
       --shadow: 0 12px 30px rgba(23, 32, 42, 0.08);
     }
 
@@ -915,6 +988,12 @@ WEB_HTML = r"""
       background: var(--accent);
       color: var(--accent-ink);
       border-color: var(--accent);
+    }
+
+    button.liked {
+      background: var(--pink);
+      color: var(--pink-ink);
+      border-color: var(--pink);
     }
 
     button.warn {
@@ -1216,11 +1295,13 @@ WEB_HTML = r"""
     const FAST_REFRESH_MS = 500;
     const IMMEDIATE_REFRESH_MS = 100;
     const END_REFRESH_WINDOW_MS = 10000;
+    const PLAYER_ACTION_FAST_REFRESH_WINDOW_MS = 3000;
     let timer = null;
     let currentTrackId = "";
     let pendingTrackChangeFromTrackId = null;
     let isSeeking = false;
     let playerActionInFlight = false;
+    let fastRefreshUntil = 0;
     const expandedLabelArtistIds = new Set();
 
     refreshButton.addEventListener("click", () => refresh());
@@ -1271,6 +1352,7 @@ WEB_HTML = r"""
       const durationMs = Number(data.track?.duration_ms || 0);
       const actionName = String(data.action?.name || "");
       const actionPerformed = Boolean(data.action?.performed);
+      const inPlayerActionFastRefreshWindow = Date.now() < fastRefreshUntil;
       const timeUntilEndMs = durationMs > 0 && progressMs >= 0
         ? durationMs - progressMs
         : null;
@@ -1286,6 +1368,10 @@ WEB_HTML = r"""
 
       if (actionPerformed && ["skip", "next", "previous"].includes(actionName)) {
         pendingTrackChangeFromTrackId = trackId || pendingTrackChangeFromTrackId;
+        return IMMEDIATE_REFRESH_MS;
+      }
+
+      if (inPlayerActionFastRefreshWindow) {
         return IMMEDIATE_REFRESH_MS;
       }
 
@@ -1343,9 +1429,12 @@ WEB_HTML = r"""
             </div>
             <div class="controls">
               <button type="button" data-player-action="previous">Prev</button>
+              <button type="button" data-player-action="toggle-playback">${data.track.is_playing ? "Pause" : "Play"}</button>
               <button type="button" data-player-action="next">Next</button>
-              <button class="warn" type="button" data-player-action="skip-to-keep">跳到保留</button>
-              <button class="primary" type="button" data-player-action="like" data-track-id="${escapeAttr(data.track.id)}">Like</button>
+              <button class="primary ${data.track.is_liked ? "liked" : ""}" type="button" data-player-action="like"
+                data-track-id="${escapeAttr(data.track.id)}"
+                data-track-is-liked="${data.track.is_liked ? "1" : "0"}">${data.track.is_liked ? "Liked" : "Like"}</button>
+              <button class="warn" type="button" data-player-action="skip-to-keep">Skip</button>
             </div>
           </div>
         </section>
@@ -1569,9 +1658,14 @@ WEB_HTML = r"""
           ? "/api/player/next"
           : action === "skip-to-keep"
             ? "/api/player/skip-to-keep"
-            : "/api/tracks/like";
+            : action === "toggle-playback"
+              ? "/api/player/toggle-playback"
+              : "/api/tracks/like";
       const payload = action === "like"
-        ? { track_id: button.dataset.trackId }
+        ? {
+            track_id: button.dataset.trackId,
+            is_liked: button.dataset.trackIsLiked === "1",
+          }
         : {};
       const previousTrackId = currentTrackId;
 
@@ -1590,6 +1684,7 @@ WEB_HTML = r"""
         if (action === "previous" || action === "next" || action === "skip-to-keep") {
           pendingTrackChangeFromTrackId = previousTrackId || currentTrackId || null;
         }
+        fastRefreshUntil = Date.now() + PLAYER_ACTION_FAST_REFRESH_WINDOW_MS;
         playerActionInFlight = false;
         await refresh();
       } catch (error) {
