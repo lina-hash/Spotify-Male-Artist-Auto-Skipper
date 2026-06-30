@@ -48,6 +48,7 @@ DEFAULT_CONFIG = {
     "queue_prefetch_tracks": 3,
     "smart_skip_max_tracks": 10,
     "skip_if_any_artist_male": True,
+    "skip_only_when_all_artists_male": True,
     "skip_unknown": False,
     "skip_groups": False,
     "skip_all_male_groups": False,
@@ -427,14 +428,26 @@ def should_skip(
         else artist_results[:1]
     )
 
-    male_names = [
-        _result_name(result)
-        for result in considered
-        if _result_gender(result) == "male"
-        and not _is_protected_male_composer(result, config)
-    ]
-    if male_names:
-        return True, f"male artist detected: {', '.join(male_names)}"
+    if bool(config.get("skip_only_when_all_artists_male", True)):
+        relevant_results = [
+            result for result in considered if not _is_protected_male_composer(result, config)
+        ]
+        male_subject_names = [
+            _result_name(result)
+            for result in relevant_results
+            if _is_male_skip_subject(result, config)
+        ]
+        if male_subject_names and len(male_subject_names) == len(relevant_results):
+            return True, f"all checked artists are male: {', '.join(male_subject_names)}"
+    else:
+        male_names = [
+            _result_name(result)
+            for result in considered
+            if _result_gender(result) == "male"
+            and not _is_protected_male_composer(result, config)
+        ]
+        if male_names:
+            return True, f"male artist detected: {', '.join(male_names)}"
 
     protected_male_names = [
         _result_name(result)
@@ -452,7 +465,9 @@ def should_skip(
         if unknown_names:
             return True, f"unknown artist gender: {', '.join(unknown_names)}"
 
-    if bool(config.get("skip_all_male_groups", False)):
+    if bool(config.get("skip_all_male_groups", False)) and not bool(
+        config.get("skip_only_when_all_artists_male", True)
+    ):
         all_male_group_names = [
             _result_name(result)
             for result in considered
@@ -703,6 +718,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
     for key in (
         "skip_if_any_artist_male",
+        "skip_only_when_all_artists_male",
         "skip_unknown",
         "skip_groups",
         "skip_all_male_groups",
@@ -791,6 +807,18 @@ def _is_protected_male_composer(
 ) -> bool:
     return bool(config.get("keep_male_composers", True)) and (
         _result_artist_role(result) == "composer_or_score"
+    )
+
+
+def _is_male_skip_subject(
+    result: ArtistGender | dict[str, Any],
+    config: dict[str, Any],
+) -> bool:
+    if _result_gender(result) == "male":
+        return True
+    return bool(config.get("skip_all_male_groups", False)) and (
+        _result_gender(result) == "group"
+        and _result_group_composition(result) == "all_male"
     )
 
 

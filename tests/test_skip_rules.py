@@ -27,9 +27,35 @@ def artist(
     )
 
 
-def test_skip_if_any_artist_male() -> None:
+def test_mixed_male_female_collaboration_is_kept_by_default() -> None:
     config = dict(DEFAULT_CONFIG)
-    config["skip_if_any_artist_male"] = True
+
+    should_skip_track, reason = should_skip(
+        [artist("Main Artist", "female"), artist("Featured Artist", "male")],
+        config,
+    )
+
+    assert should_skip_track is False
+    assert "no configured skip condition" in reason
+
+
+def test_all_male_collaboration_skips_by_default() -> None:
+    config = dict(DEFAULT_CONFIG)
+
+    should_skip_track, reason = should_skip(
+        [artist("Main Artist", "male"), artist("Featured Artist", "male")],
+        config,
+    )
+
+    assert should_skip_track is True
+    assert "all checked artists are male" in reason
+    assert "Main Artist" in reason
+    assert "Featured Artist" in reason
+
+
+def test_any_male_rule_can_be_restored() -> None:
+    config = dict(DEFAULT_CONFIG)
+    config["skip_only_when_all_artists_male"] = False
 
     should_skip_track, reason = should_skip(
         [artist("Main Artist", "female"), artist("Featured Artist", "male")],
@@ -37,6 +63,7 @@ def test_skip_if_any_artist_male() -> None:
     )
 
     assert should_skip_track is True
+    assert "male artist detected" in reason
     assert "Featured Artist" in reason
 
 

@@ -3,6 +3,7 @@
   "queue_prefetch_tracks": 3,
   "smart_skip_max_tracks": 10,
   "skip_if_any_artist_male": true,
+  "skip_only_when_all_artists_male": true,
   "skip_unknown": false,
   "skip_groups": false,
   "skip_all_male_groups": false,
