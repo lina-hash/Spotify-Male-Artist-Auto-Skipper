@@ -14,6 +14,7 @@
 - 本地 `artist_gender_cache.json` 优先，缓存缺失时先查 MusicBrainz，再用 Wikidata 兜底。
 - 团体/乐队会尽量判断成员性别组成，例如 `all_male`、`all_female`、`mixed`。
 - 支持手动标记 artist gender，也支持运行时提示标记 unknown artist 和 unknown 团体组成。
+- 支持本地网页客户端，显示当前播放信息，并用按钮修正 unknown artist。
 - 支持 `dry_run`，只打印判断结果，不真的跳过。
 
 ## 创建 Spotify App
@@ -88,6 +89,65 @@ Now playing: Song A - Artist B
 Album: Album C
 Artist B => male, confidence=0.92, source=musicbrainz
 Action: skip
+```
+
+## 网页客户端
+
+启动本地网页控制台：
+
+```powershell
+python main.py web
+```
+
+默认会打开：
+
+```text
+http://127.0.0.1:8890
+```
+
+网页会显示当前播放歌曲、专辑、artist 判断结果和当前规则下是否会跳过。Web 模式默认也会主动调用 Spotify 跳过接口；同一首歌只会处理一次，避免页面刷新导致重复跳过。遇到 `unknown` artist 时，可以直接点击按钮标记为男、女、其他、团体或未知。按钮会写入本地 `artist_gender_cache.json`，之后命令行自动跳过流程也会使用同一份缓存。
+
+如果不想自动打开浏览器：
+
+```powershell
+python main.py web --no-open
+```
+
+如果只想在网页里观察判断结果，不真的跳过：
+
+```powershell
+python main.py web --dry-run
+```
+
+如果希望网页刷新时终端也持续打印当前播放和判断结果：
+
+```powershell
+python main.py web --verbose
+```
+
+当手机或其他非本机设备访问网页客户端时，会要求登录。本机 `127.0.0.1` 访问不需要登录。可以在 `.env` 里固定用户名和密码：
+
+```text
+WEB_AUTH_USERNAME=admin
+WEB_AUTH_PASSWORD=换成一个你自己的长密码
+```
+
+如果没有设置 `WEB_AUTH_PASSWORD`，程序会在启动时生成一个临时密码并打印在终端里。本地局域网访问示例：
+
+```powershell
+python main.py web --host 0.0.0.0 --port 8890 --verbose
+```
+
+如果通过 Cloudflare Tunnel、反向代理或公网端口转发访问，必须强制所有来源登录，避免代理转发后被识别成本机请求：
+
+```powershell
+python main.py web --host 0.0.0.0 --port 8890 --auth-all --verbose
+```
+
+也可以在 `.env` 里固定开启：
+
+```text
+WEB_AUTH_ALL=true
 ```
 
 ## Dry Run

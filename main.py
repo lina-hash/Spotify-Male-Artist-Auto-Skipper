@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import shutil
 import sys
 import time
+import webbrowser
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +60,8 @@ def main() -> int:
 
     if args.command == "label":
         return label_artist(args)
+    if args.command == "web":
+        return run_web_client(args)
 
     return run_watcher(args)
 
@@ -86,6 +90,56 @@ def build_parser() -> argparse.ArgumentParser:
         "--prompt-on-unknown",
         action="store_true",
         help="Prompt to manually label unknown artists while running.",
+    )
+
+    web_parser = subparsers.add_parser("web", help="Start the local web console.")
+    web_parser.add_argument("--config", default="config.json", help="Path to config.json.")
+    web_parser.add_argument(
+        "--cache", default="artist_gender_cache.json", help="Path to artist gender cache."
+    )
+    web_parser.add_argument(
+        "--token-cache", default="token_cache.json", help="Path to Spotify token cache."
+    )
+    web_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host for the local web console.",
+    )
+    web_parser.add_argument(
+        "--port",
+        type=int,
+        default=8890,
+        help="Port for the local web console. Avoid 8888 because Spotify OAuth uses it.",
+    )
+    web_parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not open the web console in the default browser.",
+    )
+    web_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show skip decisions in the web console without calling Spotify skip.",
+    )
+    web_parser.add_argument(
+        "--web-username",
+        default=None,
+        help="Username for non-local web access. Defaults to WEB_AUTH_USERNAME or admin.",
+    )
+    web_parser.add_argument(
+        "--web-password",
+        default=None,
+        help="Password for non-local web access. Defaults to WEB_AUTH_PASSWORD or a temporary password.",
+    )
+    web_parser.add_argument(
+        "--auth-all",
+        action="store_true",
+        help="Require web login for every request, including localhost. Use this behind public tunnels.",
+    )
+    web_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print current playback and decisions whenever the web page refreshes.",
     )
 
     label_parser = subparsers.add_parser("label", help="Manually label an artist.")
@@ -155,6 +209,87 @@ def run_watcher(args: argparse.Namespace) -> int:
             time.sleep(float(config["poll_interval_seconds"]))
     except KeyboardInterrupt:
         print("\nStopped.")
+    finally:
+        resolver.close()
+
+    return 0
+
+
+def run_web_client(args: argparse.Namespace) -> int:
+    load_dotenv()
+    config = load_config(Path(getattr(args, "config", "config.json")))
+    if getattr(args, "dry_run", False):
+        config["dry_run"] = True
+
+    client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+    redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", DEFAULT_REDIRECT_URI).strip()
+    user_agent = os.getenv("MUSICBRAINZ_USER_AGENT", DEFAULT_MUSICBRAINZ_USER_AGENT).strip()
+
+    if not client_id or client_id == "your_spotify_client_id_here":
+        print_first_run_setup()
+        return 2
+
+    from spotify_auth import SpotifyPKCEAuth
+    from spotify_client import SpotifyClient
+    from web_app import create_web_app
+    import uvicorn
+
+    auth = SpotifyPKCEAuth(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        scopes=DEFAULT_SCOPES,
+        token_cache_path=getattr(args, "token_cache", "token_cache.json"),
+    )
+    spotify = SpotifyClient(auth)
+    cache = ArtistGenderCache(getattr(args, "cache", "artist_gender_cache.json"))
+    resolver = GenderResolver(cache, user_agent=user_agent)
+
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = int(getattr(args, "port", 8890))
+    web_username = (
+        str(getattr(args, "web_username", "") or "").strip()
+        or os.getenv("WEB_AUTH_USERNAME", "").strip()
+        or "admin"
+    )
+    provided_web_password = (
+        str(getattr(args, "web_password", "") or "").strip()
+        or os.getenv("WEB_AUTH_PASSWORD", "").strip()
+    )
+    web_password = provided_web_password or secrets.token_urlsafe(18)
+    require_auth_for_local = bool(getattr(args, "auth_all", False)) or _env_bool(
+        "WEB_AUTH_ALL"
+    )
+    url = f"http://{host}:{port}"
+    print(f"Web console: {url}")
+    if require_auth_for_local:
+        print("All web access requires login.")
+    else:
+        print("Non-local web access requires login.")
+    print(f"Username: {web_username}")
+    if provided_web_password:
+        print("Password: read from command line or WEB_AUTH_PASSWORD")
+    else:
+        print(f"Temporary password: {web_password}")
+    print("Press Ctrl+C to stop.")
+    if not getattr(args, "no_open", False):
+        webbrowser.open(url)
+
+    app = create_web_app(
+        spotify=spotify,
+        resolver=resolver,
+        cache=cache,
+        config=config,
+        should_skip_func=should_skip,
+        is_liked_songs_func=_is_liked_songs_playback,
+        verbose=bool(getattr(args, "verbose", False)),
+        enable_skip=True,
+        web_username=web_username,
+        web_password=web_password,
+        require_auth_for_local=require_auth_for_local,
+    )
+
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False)
     finally:
         resolver.close()
 
@@ -569,6 +704,11 @@ def print_first_run_setup() -> None:
     print("   SPOTIFY_CLIENT_ID=your_client_id_here")
     print("4. Run again with: python main.py")
     print("No client secret is needed because this app uses Authorization Code with PKCE.")
+
+
+def _env_bool(name: str) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def _extract_artists(item: dict[str, Any]) -> list[dict[str, str]]:
