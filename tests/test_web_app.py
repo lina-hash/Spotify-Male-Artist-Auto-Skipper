@@ -77,6 +77,7 @@ def test_web_current_returns_track_and_unknown_artist(tmp_path) -> None:
     assert payload["track"]["duration_ms"] == 180000
     assert payload["track"]["artists"][0]["name"] == "Mystery Artist"
     assert payload["track"]["artists"][0]["gender_label"] == "unknown"
+    assert payload["track"]["artists"][0]["display_label"] == "unknown"
     assert payload["artists"][0]["gender"] == "unknown"
     assert payload["artists"][0]["gender_label"] == "unknown"
     assert payload["artists"][0]["wiki_url"].endswith("search=Mystery+Artist")
@@ -110,8 +111,39 @@ def test_web_track_artist_display_uses_spotify_name_not_cache_name(tmp_path) -> 
 
     assert payload["track"]["artists"][0]["name"] == "Mystery Artist"
     assert payload["track"]["artists"][0]["gender_label"] == "female"
+    assert payload["track"]["artists"][0]["display_label"] == "female"
     assert payload["track"]["artists"][0]["wiki_url"].endswith("search=Mystery+Artist")
     assert payload["artists"][0]["name"] == "LA"
+
+
+def test_web_track_artist_display_shows_group_composition(tmp_path) -> None:
+    cache = ArtistGenderCache(tmp_path / "cache.json")
+    app = create_web_app(
+        spotify=FakeSpotify(_track_playback()),
+        resolver=FakeResolver(
+            {
+                "artist-1": ArtistGender(
+                    spotify_artist_id="artist-1",
+                    name="Mystery Group",
+                    gender="group",
+                    source="manual",
+                    confidence=1.0,
+                    group_composition="all_female",
+                )
+            }
+        ),
+        cache=cache,
+        config={},
+        should_skip_func=lambda artists, config: (False, "no configured skip condition matched"),
+        is_liked_songs_func=lambda playback, config: False,
+    )
+    client = TestClient(app)
+
+    payload = client.get("/api/current").json()
+
+    assert payload["track"]["artists"][0]["gender"] == "group"
+    assert payload["track"]["artists"][0]["group_composition"] == "all_female"
+    assert payload["track"]["artists"][0]["display_label"] == "group, all_female"
 
 
 def test_web_label_writes_manual_cache(tmp_path) -> None:
@@ -249,6 +281,7 @@ def test_web_html_has_expandable_album_cover() -> None:
 def test_web_html_links_track_artists_to_wikipedia() -> None:
     assert "function trackArtistLinks" in WEB_HTML
     assert "artist-wiki-link" in WEB_HTML
+    assert "artist.display_label" in WEB_HTML
     assert 'target="_blank"' in WEB_HTML
     assert 'rel="noopener noreferrer"' in WEB_HTML
 

@@ -272,16 +272,25 @@ def _track_artist_payloads(
         name = artist["name"]
         result = results_by_id.get(spotify_artist_id)
         gender = result.gender if result else "unknown"
+        group_composition = result.group_composition if result else "not_group"
         payloads.append(
             {
                 "id": spotify_artist_id,
                 "name": name,
                 "gender": gender,
                 "gender_label": _gender_display_label(gender),
+                "group_composition": group_composition,
+                "display_label": _track_artist_display_label(gender, group_composition),
                 "wiki_url": _artist_wiki_url(name),
             }
         )
     return payloads
+
+
+def _track_artist_display_label(gender: str, group_composition: str) -> str:
+    if gender == "group" and group_composition and group_composition != "not_group":
+        return f"group, {group_composition}"
+    return _gender_display_label(gender)
 
 
 def _gender_display_label(gender: str) -> str:
@@ -948,7 +957,7 @@ WEB_HTML = r"""
 
     function trackArtistLinks(artists) {
       return artists.map((artist) => {
-        const label = `${artist.name} (${artist.gender_label || artist.gender})`;
+        const label = `${artist.name} (${artist.display_label || artist.gender_label || artist.gender})`;
         if (!artist.wiki_url) {
           return escapeHtml(label);
         }
